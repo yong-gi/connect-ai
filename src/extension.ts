@@ -2136,6 +2136,31 @@ async function handleTelegramCommand(text: string): Promise<void> {
        에 자동 주입됨.
          /skill            → 대화 로그에서 직전 specialist 자동 감지
          /skill <agent_id> → 명시적으로 어느 에이전트에 저장할지 지정 */
+    if (cmd === '/queue') {
+        const open = listOpenTrackerTasks();
+        if (open.length === 0) {
+            await sendTelegramReport('열려 있는 tracker 작업이 없어요.');
+            return;
+        }
+        const preview = trackerToMarkdown({ onlyOpen: true, max: 25 });
+        const extra = open.length > 25 ? `\n\n_... 나머지 ${open.length - 25}건은 생략했어요._` : '';
+        await sendTelegramLong(`📋 *진행 중 작업 (${open.length}건)*\n\n${preview}${extra}`);
+        return;
+    }
+    if (cmd === '/progress') {
+        const idArg = rest.trim();
+        if (!idArg) {
+            await sendTelegramReport('사용법: `/progress <id>`\n예: `/progress 2407-oj8`');
+            return;
+        }
+        const match = findTrackerTaskByIdArg(idArg);
+        if (!match) {
+            await sendTelegramReport(`작업을 찾지 못했어요: \`${idArg}\`\n사용법: \`/progress <id>\`\n예: \`/progress 2407-oj8\``);
+            return;
+        }
+        await sendTelegramLong(formatTrackerTaskProgress(match));
+        return;
+    }
     if (cmd === '/skill') {
         const argId = rest.toLowerCase().trim();
         const last = _getLastSpecialistOutput();
@@ -4496,6 +4521,34 @@ function updateTrackerTask(id: string, patch: Partial<TrackerTask>): TrackerTask
 
 function listOpenTrackerTasks(): TrackerTask[] {
   return readTracker().tasks.filter(t => t.status !== 'done' && t.status !== 'cancelled');
+}
+function findTrackerTaskByIdArg(idArg: string): TrackerTask | null {
+  const needle = idArg.trim();
+  if (!needle) return null;
+  const all = readTracker().tasks;
+  return all.find(t => t.id === needle) || all.find(t => t.id.endsWith(needle)) || null;
+}
+function formatTrackerTaskProgress(task: TrackerTask): string {
+  const prio = _coercePriority(task.priority);
+  const agentIds = Array.isArray(task.agentIds) && task.agentIds.length > 0
+    ? task.agentIds.join(', ')
+    : '(없음)';
+  const dueAt = task.dueAt ? `${task.dueAt} (${_formatDueLabel(task.dueAt)})` : '(없음)';
+  const createdAt = `${task.createdAt} (${new Date(task.createdAt).toLocaleString('ko-KR')})`;
+  const evidence = (task.evidence || '').trim().replace(/\s+/g, ' ') || '(없음)';
+
+  return [
+    `📋 *작업 진행상황*`,
+    `- 제목: ${task.title}`,
+    `- id: \`${task.id.slice(-9)}\``,
+    `- status: ${task.status}`,
+    `- owner: ${task.owner}`,
+    `- agentIds: ${agentIds}`,
+    `- priority: ${prio}`,
+    `- dueAt: ${dueAt}`,
+    `- createdAt: ${createdAt}`,
+    `- evidence: ${evidence}`,
+  ].join('\n');
 }
 
 /* P1-8: Forgiving date parser for /reschedule. Covers the four shapes the
