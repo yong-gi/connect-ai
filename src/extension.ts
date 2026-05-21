@@ -2161,6 +2161,29 @@ async function handleTelegramCommand(text: string): Promise<void> {
         await sendTelegramLong(formatTrackerTaskProgress(match));
         return;
     }
+    if (cmd === '/research') {
+        const researchQuery = rest.trim();
+        if (!researchQuery) {
+            await sendTelegramReport('사용법: `/research 5060 대상 AI 수익화 강의 주제 조사해줘`');
+            return;
+        }
+        const normalizedPrompt = `@researcher ${researchQuery}`;
+        await sendTelegramReport('리서처에게 전달했어요. 잠시만 기다려주세요.');
+        const provider = _activeChatProvider as any;
+        const model = provider?.getDefaultModel?.() || getConfig().defaultModel || '';
+        try {
+            if (typeof provider?.runCorporatePromptExternal === 'function') {
+                void provider.runCorporatePromptExternal(normalizedPrompt, model);
+            } else if (typeof provider?.sendPromptFromExtension === 'function') {
+                provider.sendPromptFromExtension(normalizedPrompt, { fromTelegram: true, corporate: true });
+            } else {
+                await sendTelegramReport('리서처로 보낼 수 없어요. 아직 채팅 패널이 준비되지 않았습니다. 다시 시도해주세요.');
+            }
+        } catch (e: any) {
+            await sendTelegramReport(`리서처 전달 중 오류가 발생했어요: ${e?.message || e}`);
+        }
+        return;
+    }
     if (cmd === '/skill') {
         const argId = rest.toLowerCase().trim();
         const last = _getLastSpecialistOutput();
