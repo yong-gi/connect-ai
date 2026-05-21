@@ -2184,6 +2184,15 @@ async function handleTelegramCommand(text: string): Promise<void> {
         }
         return;
     }
+    if (cmd === '/live') {
+        const liveReport = _buildDispatchStatusReport().trim();
+        if (!liveReport) {
+            await sendTelegramReport('현재 실행 중인 작업이 없어요.');
+            return;
+        }
+        await sendTelegramLong(liveReport);
+        return;
+    }
     if (cmd === '/skill') {
         const argId = rest.toLowerCase().trim();
         const last = _getLastSpecialistOutput();
