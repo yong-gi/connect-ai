@@ -660,8 +660,8 @@ function getConfig() {
     const cfg = vscode.workspace.getConfiguration('connectAiLab');
 
     // ollamaUrl: only http(s)://localhost or 127.0.0.1 is meaningful here.
-    let ollamaBase = (cfg.get<string>('ollamaUrl', 'http://127.0.0.1:11434') || '').trim();
-    if (!/^https?:\/\//i.test(ollamaBase)) ollamaBase = 'http://127.0.0.1:11434';
+    let ollamaBase = (cfg.get<string>('ollamaUrl', 'http://127.0.0.1:1234') || '').trim();
+    if (!/^https?:\/\//i.test(ollamaBase)) ollamaBase = 'http://127.0.0.1:1234';
 
     // 사용자가 선택한 모델은 그대로 유지. 빈 값이면 빈 문자열 반환 —
     // 호출 사이트가 _autoPickInstalledModel()로 실제 설치된 모델 중 하나를
@@ -1448,7 +1448,7 @@ async function listInstalledModels(): Promise<{ id: string; backend: 'ollama' | 
   const isLMStudio = _isLMStudioEngine(ollamaBase);
   const queryOllama = async () => {
     try {
-      const r = await axios.get('http://127.0.0.1:11434/api/tags', { timeout: 1500 });
+      //const r = await axios.get('http://127.0.0.1:11434/api/tags', { timeout: 1500 });
       const models = r.data?.models || [];
       for (const m of models) {
         if (m?.name) out.push({ id: m.name, backend: 'ollama' });
@@ -8718,7 +8718,7 @@ export function activate(context: vscode.ExtensionContext) {
             let ollamaUp = false;
             let ollamaModels: string[] = [];
             try {
-                const r = await axios.get('http://127.0.0.1:11434/api/tags', { timeout: 2500 });
+                //const r = await axios.get('http://127.0.0.1:11434/api/tags', { timeout: 2500 });
                 ollamaUp = true;
                 ollamaModels = (r.data?.models || []).map((m: any) => m?.name).filter(Boolean);
                 if (ollamaModels.length > 0) ok(`Ollama 실행 중 (포트 11434) · 모델 ${ollamaModels.length}개: ${ollamaModels.slice(0, 3).join(', ')}${ollamaModels.length > 3 ? '...' : ''}`);
@@ -8752,7 +8752,7 @@ export function activate(context: vscode.ExtensionContext) {
                     ok(`설정된 서버(${baseUrl}) 도달 OK`);
                 } catch (e: any) {
                     err(`설정된 서버(${baseUrl}) 도달 실패. 설정에서 ollamaBase 확인.`);
-                    if (lmstudioUp && !isLM) warn(`  → LM Studio가 1234에서 동작 중. ollamaBase를 'http://127.0.0.1:1234/v1' 로 바꾸세요.`);
+                    if (lmstudioUp && !isLM) warn(`  → LM Studio가 1234에서 동작 중. ollamaBase를 'http://127.0.0.1:1234' 로 바꾸세요.`);
                     if (ollamaUp && isLM) warn(`  → Ollama가 11434에서 동작 중. ollamaBase를 'http://127.0.0.1:11434' 로 바꾸세요.`);
                 }
             }
