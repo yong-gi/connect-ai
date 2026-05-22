@@ -2001,8 +2001,14 @@ function readToolAutonomyLevel(agentId: string): number {
     return 2; // Draft is the safe default — agent prepares, user approves.
 }
 
-async function _quickLLMCall(systemPrompt: string, userMsg: string, maxTokens = 64): Promise<string> {
+async function _quickLLMCall(
+    systemPrompt: string,
+    userMsg: string,
+    maxTokens = 64,
+    opts?: { model?: string }
+): Promise<string> {
     const { ollamaBase, defaultModel, timeout } = getConfig();
+    const modelName = (opts?.model || defaultModel || '').trim();
     const isLMStudio = _isLMStudioEngine(ollamaBase);
     const apiUrl = isLMStudio ? `${ollamaBase}/v1/chat/completions` : `${ollamaBase}/api/chat`;
     const messages = [
@@ -2011,11 +2017,11 @@ async function _quickLLMCall(systemPrompt: string, userMsg: string, maxTokens = 
     ];
     const tmo = Math.min(timeout || 60000, 60000);
     if (isLMStudio) {
-        const body = { model: defaultModel, messages, stream: false, max_tokens: maxTokens, temperature: 0.2 };
+        const body = { model: modelName, messages, stream: false, max_tokens: maxTokens, temperature: 0.2 };
         const r = await axios.post(apiUrl, body, { timeout: tmo });
         return r.data?.choices?.[0]?.message?.content?.toString().trim() || '';
     }
-    const body = { model: defaultModel, messages, stream: false, options: { num_predict: maxTokens, temperature: 0.2 } };
+    const body = { model: modelName, messages, stream: false, options: { num_predict: maxTokens, temperature: 0.2 } };
     const r = await axios.post(apiUrl, body, { timeout: tmo });
     return r.data?.message?.content?.toString().trim() || '';
 }
@@ -2200,8 +2206,10 @@ async function handleTelegramCommand(text: string): Promise<void> {
             return;
         }
         try {
+            const cfg = getConfig();
+            const ceoModel = (vscode.workspace.getConfiguration('connectAiLab').get<string>('ceoModel') || '').trim();
             const systemPrompt = buildCeoTelegramSystemPrompt();
-            const raw = await _quickLLMCall(systemPrompt, question, 720);
+            const raw = await _quickLLMCall(systemPrompt, question, 720, { model: ceoModel || cfg.defaultModel || '' });
             const answer = sanitizeCeoTelegramText(raw).trim();
             const finalText = answer || '브레인에 근거 없음\n\n## CEO 판단\n- 브레인 근거를 찾지 못해 판단을 만들 수 없습니다.\n\n## 확인 필요\n- 관련 회사 문서와 최근 작업 기록을 다시 확인해야 합니다.';
             await sendTelegramLong(finalText);

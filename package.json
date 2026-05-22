@@ -245,6 +245,11 @@
           "default": "",
           "description": "🧠 사용할 AI 모델 이름 (비워두면 설치된 모델 중 가장 작은 것이 자동 선택됨. 직접 지정 예: llama3.2:1b, gemma2:2b, qwen2.5:1.5b)"
         },
+        "connectAiLab.ceoModel": {
+          "type": "string",
+          "default": "",
+          "description": "CEO 판단/작업분해 전용 모델명. 비어 있으면 defaultModel 사용"
+        },
         "connectAiLab.requestTimeout": {
           "type": "number",
           "default": 300,
