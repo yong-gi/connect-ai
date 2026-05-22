@@ -2193,6 +2193,23 @@ async function handleTelegramCommand(text: string): Promise<void> {
         await sendTelegramLong(liveReport);
         return;
     }
+    if (cmd === '/ceo') {
+        const question = rest.trim();
+        if (!question) {
+            await sendTelegramReport('사용법: `/ceo 지금 회사가 다음 1주일 동안 가장 우선해야 할 일은 뭐야?`');
+            return;
+        }
+        try {
+            const systemPrompt = buildCeoTelegramSystemPrompt();
+            const raw = await _quickLLMCall(systemPrompt, question, 720);
+            const answer = sanitizeCeoTelegramText(raw).trim();
+            const finalText = answer || '브레인에 근거 없음\n\n## CEO 판단\n- 브레인 근거를 찾지 못해 판단을 만들 수 없습니다.\n\n## 확인 필요\n- 관련 회사 문서와 최근 작업 기록을 다시 확인해야 합니다.';
+            await sendTelegramLong(finalText);
+        } catch (e: any) {
+            await sendTelegramReport(`CEO 보고서를 만들지 못했어요: ${e?.message || e}`);
+        }
+        return;
+    }
     if (cmd === '/skill') {
         const argId = rest.toLowerCase().trim();
         const last = _getLastSpecialistOutput();
@@ -7388,6 +7405,143 @@ function readRecentConversations(maxChars = 2500): string {
   } catch {
     return '';
   }
+}
+
+function readRecentSessionReports(maxSessions = 2, charsPerReport = 350): string {
+  try {
+    const sessionsDir = path.join(getCompanyDir(), 'sessions');
+    if (!fs.existsSync(sessionsDir)) return '';
+    const entries = fs.readdirSync(sessionsDir, { withFileTypes: true })
+      .filter(e => e.isDirectory())
+      .map(e => {
+        const full = path.join(sessionsDir, e.name);
+        let mtime = 0;
+        try { mtime = fs.statSync(full).mtimeMs; } catch { /* ignore */ }
+        return { name: e.name, full, mtime };
+      })
+      .sort((a, b) => b.mtime - a.mtime)
+      .slice(0, Math.max(1, maxSessions));
+    const lines: string[] = [];
+    for (const entry of entries) {
+      const reportPath = path.join(entry.full, '_report.md');
+      const txt = _safeReadText(reportPath).trim();
+      if (!txt) continue;
+      const snippet = txt.slice(0, Math.max(200, charsPerReport)).replace(/\s+/g, ' ').trim();
+      lines.push(`- sessions/${entry.name}/_report.md: ${snippet}`);
+    }
+    if (lines.length === 0) return '';
+    return `\n\n[최근 세션 보고서(참고용)]\n${lines.join('\n')}`;
+  } catch {
+    return '';
+  }
+}
+
+function buildCeoTelegramBrainContext(): string {
+  const dir = getCompanyDir();
+  const parts: string[] = [];
+  try {
+    const identity = _safeReadText(path.join(dir, '_shared', 'identity.md')).trim();
+    if (identity) parts.push(`[identity.md]\n${identity.slice(0, 400)}`);
+  } catch { /* ignore */ }
+  try {
+    const goals = _safeReadText(path.join(dir, '_shared', 'goals.md')).trim();
+    if (goals) parts.push(`[goals.md]\n${goals.slice(0, 400)}`);
+  } catch { /* ignore */ }
+  try {
+    const decisions = _safeReadText(path.join(dir, '_shared', 'decisions.md')).trim();
+    if (decisions) parts.push(`[decisions.md]\n${decisions.slice(0, 500)}`);
+  } catch { /* ignore */ }
+  try {
+    const schedule = _safeReadText(path.join(dir, '_shared', 'schedule.md')).trim();
+    if (schedule) parts.push(`[schedule.md]\n${schedule.slice(0, 500)}`);
+  } catch { /* ignore */ }
+  try {
+    const ceoGoal = readAgentGoal('ceo').trim();
+    if (ceoGoal) parts.push(`[ceo/goal.md]\n${ceoGoal.slice(0, 350)}`);
+  } catch { /* ignore */ }
+  try {
+    const ceoMemory = _safeReadText(path.join(dir, '_agents', 'ceo', 'memory.md')).trim();
+    if (ceoMemory) parts.push(`[ceo/memory.md]\n${ceoMemory.slice(0, 300)}`);
+  } catch { /* ignore */ }
+  try {
+    const tracker = trackerToMarkdown({ onlyOpen: true, max: 5 }).trim();
+    if (tracker) parts.push(`[tracker open tasks max 5]\n${tracker.slice(0, 900)}`);
+  } catch { /* ignore */ }
+  try {
+    const recentReports = readRecentSessionReports(2, 250).trim();
+    if (recentReports) parts.push(recentReports);
+  } catch { /* ignore */ }
+  try {
+    const recentCompanyLog = readRecentConversations(500).trim();
+    if (recentCompanyLog) parts.push(recentCompanyLog);
+  } catch { /* ignore */ }
+  return parts.join('\n\n');
+}
+
+function buildCeoTelegramSystemPrompt(): string {
+  const company = readCompanyName();
+  const brainContext = buildCeoTelegramBrainContext();
+  return [
+    _personalizePrompt(CEO_REPORT_PROMPT),
+    '',
+    `[CEO Telegram /ceo 모드 - 텍스트 전용 분석 규칙]`,
+    `- 회사 brain과 작업 기록에 근거한 판단만 한다.`,
+    `- 일반 지식보다 현재 회사 상태를 우선한다.`,
+    `- 브레인 근거와 CEO 추론을 구분해서 출력한다.`,
+    `- 근거가 없으면 반드시 "브레인에 근거 없음"이라고 표시한다.`,
+    `- tool, Python, API, YouTube, run_command, 파일 조작은 금지한다.`,
+    `- <run_command>, <create_file>, <edit_file> 같은 실행/파일 조작 태그는 절대 출력하지 않는다.`,
+    `- 짧고 압축된 CEO 보고서만 작성한다. 한 번에 읽히는 분량으로 제한한다.`,
+    `- Brain 근거는 최대 3개 bullet.`,
+    `- CEO 판단은 최대 3개 bullet.`,
+    `- 다음 7일 우선순위는 Top 3만.`,
+    `- 확인 필요는 최대 2개 bullet.`,
+    `- 전체 답변은 간결하게 유지하고 장황한 설명은 피한다.`,
+    `- 근거 신뢰도 우선순위: 1) _shared/identity.md 2) _shared/goals.md 3) _shared/decisions.md 4) tracker.json 5) sessions/_report.md 6) raw conversations.`,
+    `- sessions/_report.md는 확정 전략이 아니라 과거 테스트/참고 기록으로만 취급한다.`,
+    `- sessions 내용이 identity/goals/decisions와 충돌하면 sessions를 낮은 신뢰도로 판단하고, decisions를 반드시 우선한다.`,
+    `- tests/research, 가설, 실험, 샘플 전략, 테스트성 SaaS 리서치 결과는 회사의 확정 방향으로 해석하지 말고 참고 기록으로만 다룬다.`,
+    `- 현재 Connect AI 프로젝트를 AI 소셜 미디어 스케줄러 SaaS라고 단정하지 않는다.`,
+    `- Hootsuite, Buffer, 소셜 미디어 스케줄링, 커스텀 콘텐츠 생성, 고급 분석 보고서는 과거 테스트성 리서치 결과일 수 있으며 확정 전략이 아니다.`,
+    `- 위 내용이 decisions/goals와 충돌하면 낮은 신뢰도의 참고 기록으로만 다루고, 실제 우선순위는 현재 Connect AI의 운영 상태를 기준으로 판단한다.`,
+    `- 현재 우선순위는 Telegram Control v1, brain-grounded CEO, 안전한 자동화 구조, /delegate, /run-safe, /result 검토 쪽이어야 한다.`,
+    `- 브레인에 근거가 부족하면 추측하지 말고 반드시 "브레인에 근거 없음"이라고 답한다.`,
+    `- 회사명: ${company || 'Unknown'}`,
+    '',
+    `[참고 브레인 컨텍스트]`,
+    brainContext || '(참고 브레인 컨텍스트 없음)',
+    '',
+    `[출력 형식]`,
+    `## 브레인 근거`,
+    `- 어떤 파일/기록을 근거로 삼았는지 bullet로 적고, 각 bullet 끝에 [identity] [goals] [decisions] [tracker] [sessions: 참고] [conversations] 중 하나를 짧게 표시한다.`,
+    `- 세션이나 대화에서 온 내용이면 반드시 [sessions: 참고] 또는 [conversations]로 표시한다.`,
+    `- sessions만으로 판단하지 말고, decisions/goals/identity와 충돌하면 sessions는 배제한다.`,
+    `- 근거가 없으면 "- 브레인에 근거 없음"이라고 적는다.`,
+    `## CEO 판단`,
+    `- 브레인 근거를 바탕으로 무엇을 해야 하는지 판단한다.`,
+    `- 세션의 리서치 문장은 확정 전략이 아니라 참고로만 반영한다.`,
+    `- 근거가 약하면 억지로 결론을 내지 말고 "브레인에 근거 없음"을 유지한다.`,
+    `## 확인 필요`,
+    `- 추가 확인이 필요한 항목만 적는다.`,
+  ].join('\n');
+}
+
+function sanitizeCeoTelegramText(text: string): string {
+  return (text || '')
+    .replace(/<(?:create_file|write_file|file)\b[^>]*>[\s\S]*?<\/(?:create_file|write_file|file)>/gi, '')
+    .replace(/<(?:edit_file|edit)\b[^>]*>[\s\S]*?<\/(?:edit_file|edit)>/gi, '')
+    .replace(/<(?:delete_file|delete)\b[^>]*\s*\/?>(?:<\/(?:delete_file|delete)>)?/gi, '')
+    .replace(/<(?:read_file|read)\b[^>]*\s*\/?>(?:<\/(?:read_file|read)>)?/gi, '')
+    .replace(/<(?:list_files|list_dir|ls)\b[^>]*\s*\/?>(?:<\/(?:list_files|list_dir|ls)>)?/gi, '')
+    .replace(/<(?:reveal_in_explorer|reveal|finder|explorer)\b[^>]*\s*\/?>(?:<\/(?:reveal_in_explorer|reveal|finder|explorer)>)?/gi, '')
+    .replace(/<(?:open_file|open_in_app|launch)\b[^>]*\s*\/?>(?:<\/(?:open_file|open_in_app|launch)>)?/gi, '')
+    .replace(/<glob\b[^>]*\s*\/?>(?:<\/glob>)?/gi, '')
+    .replace(/<grep\b[^>]*\s*\/?>(?:<\/grep>)?/gi, '')
+    .replace(/<(?:run_command|command|bash|terminal)>[\s\S]*?<\/(?:run_command|command|bash|terminal)>/gi, '')
+    .replace(/<(?:read_brain)>[\s\S]*?<\/(?:read_brain)>/gi, '')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
 }
 
 function makeSessionDir(): string {
