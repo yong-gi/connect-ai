@@ -2167,6 +2167,59 @@ async function handleTelegramCommand(text: string): Promise<void> {
         await sendTelegramLong(formatTrackerTaskProgress(match));
         return;
     }
+    if (cmd === '/run-safe') {
+        const idArg = rest.trim();
+        if (!idArg) {
+            await sendTelegramReport('사용법: `/run-safe <id>`\n예: `/run-safe 1650-ujal`');
+            return;
+        }
+        const match = findTrackerTaskByIdArg(idArg);
+        if (!match) {
+            await sendTelegramReport(`작업을 찾지 못했어요: \`${idArg}\`\n사용법: \`/run-safe <id>\`\n예: \`/run-safe 1650-ujal\``);
+            return;
+        }
+        if (match.status === 'done') {
+            await sendTelegramReport('이미 완료된 작업입니다.');
+            return;
+        }
+        if (match.status !== 'pending') {
+            await sendTelegramReport(`현재 status가 \`${match.status}\`라서 실행할 수 없어요. \`pending\` 상태만 안전 실행합니다.`);
+            return;
+        }
+        const deps = Array.isArray(match.dependsOn) ? match.dependsOn.filter(Boolean) : [];
+        for (const depId of deps) {
+            const dep = findTrackerTaskByIdArg(depId);
+            if (!dep) {
+                await sendTelegramReport(`의존 작업을 찾지 못했어요: \`${depId}\``);
+                return;
+            }
+            if (dep.status === 'cancelled' || dep.status === 'failed') {
+                await sendTelegramReport(`선행 작업이 취소 또는 실패 상태예요: \`${dep.id}\``);
+                return;
+            }
+            if (dep.status !== 'done') {
+                await sendTelegramReport(`선행 작업이 아직 완료되지 않았어요: \`${dep.id}\``);
+                return;
+            }
+        }
+        updateTrackerTask(match.id, { status: 'in_progress' });
+        await sendTelegramReport(`🛡️ \`${match.id.slice(-9)}\` ${match.title}\n→ 안전 실행을 시작했어요.`);
+        try {
+            const result = await _runSafeExecuteTask(match);
+            await sendTelegramLong(result.message);
+        } catch (e: any) {
+            const errMsg = e?.message || String(e);
+            const evidence = /timeout/i.test(errMsg)
+                ? `run-safe timeout: ${match.id}\n${errMsg}`
+                : `run-safe 오류: ${match.id}\n${errMsg}`;
+            updateTrackerTask(match.id, {
+                status: 'failed',
+                evidence,
+            });
+            await sendTelegramReport(`run-safe 실행 중 오류가 발생했어요: ${errMsg}`);
+        }
+        return;
+    }
     if (cmd === '/research') {
         const researchQuery = rest.trim();
         if (!researchQuery) {
@@ -3820,7 +3873,7 @@ async function _runTrackerNudgeOnce() {
         let changed = false;
         const nudges: string[] = [];
         for (const t of tracker.tasks) {
-            if (t.status === 'done' || t.status === 'cancelled') continue;
+            if (t.status === 'done' || t.status === 'cancelled' || t.status === 'failed') continue;
             if (t.owner !== 'user' && t.owner !== 'mixed') continue;
             const lastNudge = (t as any)._lastNudgeAt ? new Date((t as any)._lastNudgeAt).getTime() : 0;
             if (now - lastNudge < _NUDGE_WINDOW_MS) continue;
@@ -4109,7 +4162,7 @@ interface TrackerTask {
   agentIds?: string[];
   createdAt: string;
   dueAt?: string;
-  status: 'pending' | 'in_progress' | 'done' | 'cancelled';
+  status: 'pending' | 'in_progress' | 'done' | 'cancelled' | 'failed';
   completedAt?: string;
   sessionDir?: string;
   nudges?: number; /* how many telegram nudges sent for stale user tasks */
@@ -4695,7 +4748,7 @@ function _delegateFindPlanIdArg(arg: string): string | null {
 function _delegateSelectPlanId(): string | null {
   const all = readTracker().tasks.filter(t => (t.planId || '').trim());
   if (all.length === 0) return null;
-  const open = all.filter(t => t.status !== 'done' && t.status !== 'cancelled');
+  const open = all.filter(t => _isOpenTrackerTask(t));
   const pool = open.length > 0 ? open : all;
   pool.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
   return pool[0].planId || null;
@@ -4776,8 +4829,16 @@ function updateTrackerTask(id: string, patch: Partial<TrackerTask>): TrackerTask
   return t.tasks[idx];
 }
 
+function _isOpenTrackerTask(task: TrackerTask): boolean {
+  return task.status !== 'done' && task.status !== 'cancelled' && task.status !== 'failed';
+}
+
+function _isClosedTrackerTask(task: TrackerTask): boolean {
+  return task.status === 'done' || task.status === 'cancelled' || task.status === 'failed';
+}
+
 function listOpenTrackerTasks(): TrackerTask[] {
-  return readTracker().tasks.filter(t => t.status !== 'done' && t.status !== 'cancelled');
+  return readTracker().tasks.filter(t => _isOpenTrackerTask(t));
 }
 function findTrackerTaskByIdArg(idArg: string): TrackerTask | null {
   const needle = idArg.trim();
@@ -4806,6 +4867,137 @@ function formatTrackerTaskProgress(task: TrackerTask): string {
     `- createdAt: ${createdAt}`,
     `- evidence: ${evidence}`,
   ].join('\n');
+}
+
+function _runSafeAllowedAgentId(task: TrackerTask): string {
+  const first = Array.isArray(task.agentIds) && task.agentIds.length > 0 ? String(task.agentIds[0] || '').trim().toLowerCase() : '';
+  return first && ['researcher', 'business', 'writer', 'developer', 'ceo', 'secretary'].includes(first) ? first : 'ceo';
+}
+
+function _runSafeTaskBucket(task: TrackerTask): string {
+  if (task.planId && task.planId.trim()) {
+    return task.planId.trim().replace(/[^a-zA-Z0-9._-]+/g, '-').slice(0, 80);
+  }
+  return new Date(task.createdAt || Date.now()).toISOString().slice(0, 10);
+}
+
+function _runSafeSummarize(text: string, maxLen = 260): string {
+  const compact = (text || '').replace(/\s+/g, ' ').trim();
+  return compact.slice(0, maxLen);
+}
+
+function _runSafePlanSummary(task: TrackerTask): string {
+  const planId = (task.planId || '').trim();
+  if (!planId) return '(없음)';
+  const tasks = readTracker().tasks
+    .filter(t => (t.planId || '').trim() === planId)
+    .slice()
+    .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime())
+    .slice(0, 6);
+  if (tasks.length === 0) return '(없음)';
+  return tasks.map(t => {
+    const a = (t.agentIds && t.agentIds[0]) ? t.agentIds[0] : 'ceo';
+    return `- ${t.id.slice(-9)} ${t.status} ${a}: ${t.title.slice(0, 36)}`;
+  }).join('\n');
+}
+
+function _runSafeDepsSummary(task: TrackerTask): string {
+  const deps = Array.isArray(task.dependsOn) ? task.dependsOn.filter(Boolean) : [];
+  if (deps.length === 0) return '(없음)';
+  return deps.map(depId => {
+    const dep = findTrackerTaskByIdArg(depId);
+    if (!dep) return `- ${depId}: not found`;
+    const summary = dep.status === 'done' && dep.resultSummary ? ` / ${dep.resultSummary.slice(0, 80)}` : '';
+    return `- ${dep.id.slice(-9)} ${dep.status}${summary}`;
+  }).join('\n');
+}
+
+function _runSafeBuildSystemPrompt(agentId: string, task: TrackerTask): string {
+  const roleRules: Record<string, string> = {
+    researcher: '핵심 가설 3개 / 타깃 니즈 3개 / 강의 주제 후보 3개 / 다음 확인 필요 2개',
+    business: '상품 구조 / 가격 전략 / 운영 방식 / 리스크',
+    writer: '커리큘럼 초안 / 모집글 핵심 문구 / CTA',
+    developer: '구현 계획 / 자동화 포인트 / 리스크',
+    ceo: '최종 판단 / 우선순위 / 다음 액션',
+    secretary: '요약 / 정리 / 체크리스트',
+  };
+  return [
+    `당신은 ${AGENTS[agentId]?.name || 'CEO'}입니다.`,
+    `주어진 task만 처리하세요.`,
+    `외부 검색/tool 실행 금지.`,
+    `Python/API/YouTube/Leo 실행 금지.`,
+    `run_command/create_file/edit_file 출력 금지.`,
+    `텍스트 결과만 작성하세요.`,
+    `700~1200자 내 압축 보고서로 답하세요.`,
+    `근거가 부족하면 "현재 제공된 정보 기준 초안"이라고 표시하세요.`,
+    `출력 형식: ${roleRules[agentId] || roleRules.ceo}.`,
+    '',
+    `taskId: ${task.id}`,
+    `title: ${task.title}`,
+    `description: ${task.description || '(없음)'}`,
+    `agentId: ${agentId}`,
+    `planId: ${task.planId || '(없음)'}`,
+    `stage: ${typeof task.stage === 'undefined' ? '(없음)' : String(task.stage)}`,
+    `dependsOn: ${Array.isArray(task.dependsOn) && task.dependsOn.length > 0 ? task.dependsOn.join(', ') : '(없음)'}`,
+    '',
+    `[같은 plan 작업]`,
+    _runSafePlanSummary(task),
+    '',
+    `[완료된 선행 작업 요약]`,
+    _runSafeDepsSummary(task),
+  ].join('\n');
+}
+
+async function _runSafeExecuteTask(task: TrackerTask): Promise<{ ok: boolean; message: string }> {
+  const agentId = _runSafeAllowedAgentId(task);
+  const cfg = getConfig();
+  const systemPrompt = _runSafeBuildSystemPrompt(agentId, task);
+  const userPrompt = [
+    `작업 제목: ${task.title}`,
+    `설명: ${task.description || '(없음)'}`,
+    `이 작업을 안전 실행용 텍스트 결과로 정리하세요.`,
+    `반드시 외부 도구 없이, 텍스트 결과만 작성하세요.`,
+  ].join('\n');
+  const modelOverride = agentId === 'ceo'
+    ? (vscode.workspace.getConfiguration('connectAiLab').get<string>('ceoModel') || '').trim() || cfg.defaultModel || ''
+    : cfg.defaultModel || '';
+  const raw = await _quickLLMCall(systemPrompt, userPrompt, 700, { model: modelOverride });
+  const cleaned = sanitizeCeoTelegramText(raw).trim();
+  const resultText = cleaned || '결과 없음';
+  const bucket = _runSafeTaskBucket(task);
+  const sessionsRoot = path.join(getCompanyDir(), 'sessions', bucket);
+  fs.mkdirSync(sessionsRoot, { recursive: true });
+  const shortId = task.id.slice(-9).replace(/[^a-zA-Z0-9_-]+/g, '-');
+  const resultPath = path.join(sessionsRoot, `task-${shortId}.md`);
+  const completedAt = new Date().toISOString();
+  const fileBody = [
+    `# Run Safe Result`,
+    ``,
+    `- taskId: ${task.id}`,
+    `- title: ${task.title}`,
+    `- agentId: ${agentId}`,
+    `- createdAt: ${task.createdAt}`,
+    `- completedAt: ${completedAt}`,
+    `- resultSummary: ${_runSafeSummarize(resultText)}`,
+    ``,
+    `## Result`,
+    resultText,
+    ``,
+  ].join('\n');
+  fs.writeFileSync(resultPath, fileBody, 'utf-8');
+  const relativePath = path.relative(getCompanyDir(), resultPath).replace(/\\/g, '/');
+  const summary = _runSafeSummarize(resultText);
+  updateTrackerTask(task.id, {
+    status: 'done',
+    completedAt,
+    resultPath,
+    resultSummary: summary,
+    evidence: [
+      `결과 파일: ${relativePath}`,
+      `요약: ${summary}`,
+    ].join('\n'),
+  });
+  return { ok: true, message: `✅ run-safe 완료\n- 작업: \`${task.id.slice(-9)}\` ${task.title}\n- 결과 요약: ${summary}\n- 결과 파일: \`${relativePath}\`` };
 }
 
 /* P1-8: Forgiving date parser for /reschedule. Covers the four shapes the
@@ -4877,7 +5069,7 @@ function _runRecurrenceTickOnce() {
         let anySpawned = false;
         for (const t of tracker.tasks) {
             if (!t.recurrence) continue;
-            if (t.status === 'cancelled') continue;
+            if (t.status === 'cancelled' || t.status === 'failed') continue;
             if (!t.nextRunAt) {
                 /* First time we've seen this template — schedule from createdAt
                    so freshly-added recurring tasks don't fire immediately. */
@@ -4944,7 +5136,7 @@ async function _runPreAlarmTickOnce(): Promise<void> {
         let changed = false;
         const lines: string[] = [];
         for (const t of tracker.tasks) {
-            if (t.status === 'done' || t.status === 'cancelled') continue;
+            if (t.status === 'done' || t.status === 'cancelled' || t.status === 'failed') continue;
             if (!t.dueAt) continue;
             const due = new Date(t.dueAt).getTime();
             if (isNaN(due) || due < now) continue;
@@ -5008,7 +5200,7 @@ function _harvestActionItems(text: string): string[] {
 
 function trackerToMarkdown(opts: { onlyOpen?: boolean; max?: number } = {}): string {
   const all = readTracker().tasks;
-  const tasks = opts.onlyOpen ? all.filter(t => t.status !== 'done' && t.status !== 'cancelled') : all;
+  const tasks = opts.onlyOpen ? all.filter(t => _isOpenTrackerTask(t)) : all;
   if (tasks.length === 0) return '';
   /* Sort: status (in_progress > pending > done) → priority (urgent > high > normal > low)
      → newest createdAt within ties. Status before priority means a 'done urgent'
@@ -5093,8 +5285,8 @@ class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeItem> {
                group for closed. Hide empty groups so we don't show
                "🔴 긴급 (0)" noise on a fresh install. Counts include the
                #stale flag (overdue user tasks) as a small adornment. */
-            const open = all.filter(t => t.status !== 'done' && t.status !== 'cancelled');
-            const closed = all.filter(t => t.status === 'done' || t.status === 'cancelled');
+            const open = all.filter(t => _isOpenTrackerTask(t));
+            const closed = all.filter(t => _isClosedTrackerTask(t));
             const prioOrder: TaskPriority[] = ['urgent', 'high', 'normal', 'low'];
             const items: TaskTreeItem[] = [];
             for (const p of prioOrder) {
@@ -5142,11 +5334,11 @@ class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeItem> {
         if (!parent.groupKey) return [];
         let tasks: TrackerTask[];
         if (parent.groupKey === 'closed') {
-            tasks = all.filter(t => t.status === 'done' || t.status === 'cancelled');
+            tasks = all.filter(t => _isClosedTrackerTask(t));
             tasks.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
             tasks = tasks.slice(0, 30); /* don't load infinite history */
         } else {
-            tasks = all.filter(t => t.status !== 'done' && t.status !== 'cancelled' && _coercePriority(t.priority) === parent.groupKey);
+            tasks = all.filter(t => _isOpenTrackerTask(t) && _coercePriority(t.priority) === parent.groupKey);
             /* Within group: due-imminent first, then stale, then newest. */
             const now = Date.now();
             const score = (t: TrackerTask) => {
@@ -5213,6 +5405,7 @@ function _priorityGroupIcon(p: TaskPriority): vscode.ThemeIcon {
 function _taskStatusIcon(t: TrackerTask): vscode.ThemeIcon {
     if (t.status === 'done')      return new vscode.ThemeIcon('pass-filled', new vscode.ThemeColor('charts.green'));
     if (t.status === 'cancelled') return new vscode.ThemeIcon('circle-slash', new vscode.ThemeColor('descriptionForeground'));
+    if (t.status === 'failed')    return new vscode.ThemeIcon('error', new vscode.ThemeColor('errorForeground'));
     /* Open task — visual urgency derived from due. Codicon 'sync~spin' is
        VS Code's native spinner — used for in_progress to show "AI is on it". */
     if (t.dueAt) {
@@ -5261,7 +5454,7 @@ function autoMarkTrackerFromDispatch(plan: { brief?: string; tasks?: { agent: st
        too narrow: if user issued "이거 해" yesterday and CEO finishes today,
        the task would stay pending forever. */
     const fresh = tracker.tasks.filter(t =>
-      t.status !== 'done' && t.status !== 'cancelled' &&
+      t.status !== 'done' && t.status !== 'cancelled' && t.status !== 'failed' &&
       (now - new Date(t.createdAt).getTime()) < 24 * 60 * 60_000
     );
     if (fresh.length === 0) return;
@@ -12017,7 +12210,7 @@ class CompanyDashboardPanel {
         const oauthConnected = isYoutubeOAuthConnected();
         const company = readCompanyName() || '1인 기업';
         const tracker = readTracker().tasks;
-        const openTasks = tracker.filter(t => t.status !== 'done' && t.status !== 'cancelled');
+        const openTasks = tracker.filter(t => _isOpenTrackerTask(t));
         const overdueTasks = openTasks.filter(t => t.dueAt && new Date(t.dueAt).getTime() < Date.now()).length;
         const urgentTasks = openTasks.filter(t => _coercePriority(t.priority) === 'urgent').length;
         const pendingApprovals = listPendingApprovals();
