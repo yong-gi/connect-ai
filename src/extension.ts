@@ -2218,6 +2218,75 @@ async function handleTelegramCommand(text: string): Promise<void> {
         }
         return;
     }
+    if (cmd === '/delegate') {
+        const goal = rest.trim();
+        if (!goal) {
+            await sendTelegramReport('사용법: `/delegate 5060 대상 AI 수익화 강의 사업을 준비해줘. 2주 안에 첫 파일럿 모집글까지 올리고 싶어.`');
+            return;
+        }
+        try {
+            const systemPrompt = buildDelegateTelegramSystemPrompt();
+            const model = getCeoPlanningModel();
+            const raw = await _quickLLMCall(systemPrompt, goal, 720, { model });
+            const parsed = _delegateParsePlan(raw);
+            if (!parsed || !Array.isArray(parsed.tasks) || parsed.tasks.length === 0) {
+                const preview = sanitizeCeoTelegramText(raw).trim().slice(0, 1500) || '(미리보기 없음)';
+                await sendTelegramLong(`❗ *작업 등록 실패 / 계획 미리보기*\n\n${preview}\n\n_추가로 등록은 하지 않았어요._`);
+                return;
+            }
+
+            const planned = _delegateNormalizeTasks(goal, parsed);
+            const created: TrackerTask[] = [];
+            const skipped: string[] = [];
+            for (const task of planned.tasks.slice(0, 5)) {
+                if (!task.required && _delegateHasDuplicateTitle(task.title)) {
+                    skipped.push(task.title);
+                    continue;
+                }
+                const taskOwner: TrackerTask['owner'] = 'agent';
+                const createdTask = addTrackerTask({
+                    title: task.title,
+                    description: [
+                        task.description,
+                        `\n[delegate goal] ${goal.slice(0, 400)}`,
+                        planned.summary ? `[delegate summary] ${planned.summary}` : ''
+                    ].filter(Boolean).join('\n').trim().slice(0, 1000),
+                    owner: taskOwner,
+                    agentIds: [task.agentId],
+                    status: 'pending',
+                    priority: task.priority,
+                    dueAt: task.dueAt || undefined,
+                });
+                created.push(createdTask);
+            }
+
+            if (created.length === 0) {
+                const preview = sanitizeCeoTelegramText(raw).trim().slice(0, 1500) || '(미리보기 없음)';
+                const note = skipped.length > 0 ? `\n\n_중복 제목으로 제외된 항목: ${skipped.length}개_` : '';
+                await sendTelegramLong(`❗ *작업 등록 실패 / 계획 미리보기*\n\n${preview}${note}\n\n_새로 등록된 작업은 없어요._`);
+                return;
+            }
+
+            const lines: string[] = [];
+            lines.push(`✅ *작업 ${created.length}개 등록 완료*`);
+            lines.push('');
+            lines.push('*등록된 작업*');
+            for (const task of created) {
+                const a = AGENTS[(task.agentIds && task.agentIds[0]) || 'ceo'] || AGENTS.ceo;
+                lines.push(`- ${a.emoji} ${a.name}: \`${task.id.slice(-9)}\` ${task.title}`);
+            }
+            if (skipped.length > 0) {
+                lines.push('');
+                lines.push(`_중복 제목으로 제외: ${skipped.length}개_`);
+            }
+            lines.push('');
+            lines.push('다음 확인: `/queue`, `/progress <id>`');
+            await sendTelegramLong(lines.join('\n'));
+        } catch (e: any) {
+            await sendTelegramReport(`작업 분해 중 오류가 발생했어요: ${e?.message || e}`);
+        }
+        return;
+    }
     if (cmd === '/skill') {
         const argId = rest.toLowerCase().trim();
         const last = _getLastSpecialistOutput();
@@ -7532,6 +7601,467 @@ function buildCeoTelegramSystemPrompt(): string {
     `## 확인 필요`,
     `- 추가 확인이 필요한 항목만 적는다.`,
   ].join('\n');
+}
+
+const DELEGATE_ALLOWED_AGENT_IDS = new Set(['researcher', 'business', 'writer', 'developer', 'ceo', 'secretary']);
+const DELEGATE_ROLE_ORDER = ['researcher', 'business', 'writer', 'developer', 'ceo', 'secretary'] as const;
+const DELEGATE_KOREAN_RE = /[가-힣]/;
+const DELEGATE_BUSINESS_GOAL_RE = /(사업|강의|파일럿|수익화|가격|상품|운영|런칭|출시|세일즈|모집|monetiz|pricing|pilot|launch|sales|course|class|workshop)/i;
+const DELEGATE_WRITER_GOAL_RE = /(모집|모집글|랜딩|상세페이지|커리큘럼|홍보|카피|문구|소개글|신청|landing page|curriculum|copy|promotional)/i;
+const DELEGATE_TEMPLATE_GOAL_RE = /(강의|사업|파일럿|모집글|수익화|5060)/i;
+const DELEGATE_POSTING_RE = /(게시|발행|등록|배포|공개|업로드|publish|posting|post|release)/i;
+const DELEGATE_CEO_COORDINATION_RE = /(최종|실행계획|우선순위|일정|조율|의사결정|판단|정리|검토)/i;
+const DELEGATE_CEO_UNSAFE_RE = /(디자인|설계|작성|게시|발행|제작|생산|홍보물|문구|모집글|상세페이지|커리큘럼|design|write|post|publish|create|draft|make|build|produce|visual|promotional)/i;
+
+const DELEGATE_ROLE_DEFAULTS: Record<string, { title: string; description: string; priority: TaskPriority }> = {
+  researcher: {
+    title: '5060 대상 AI 수익화 강의 반응 주제 조사',
+    description: '5060 대상 고객의 관심 주제, 반응이 좋은 강의 주제, 경쟁 사례를 조사한다.',
+    priority: 'high',
+  },
+  business: {
+    title: '파일럿 강의 상품 구조와 가격 전략 정리',
+    description: '5060 대상 AI 수익화 강의의 파일럿 상품 구성, 가격, 운영 방식, 수익 모델을 정리한다.',
+    priority: 'high',
+  },
+  writer: {
+    title: '파일럿 강의 커리큘럼과 모집글 초안 작성',
+    description: '파일럿 모집글, 상세페이지, 커리큘럼 초안, 홍보 문구를 한국어로 정리한다.',
+    priority: 'normal',
+  },
+  developer: {
+    title: '필요 자동화/도구 구현 검토',
+    description: '목표 달성에 필요한 자동화, 도구, 웹, 시스템 구현 필요성을 검토한다.',
+    priority: 'normal',
+  },
+  ceo: {
+    title: '2주 파일럿 실행계획과 우선순위 최종 정리',
+    description: '전체 실행 순서, 역할 분담, 우선순위, 일정 조율을 최종 정리한다.',
+    priority: 'high',
+  },
+  secretary: {
+    title: '실행 조건과 확인사항 정리',
+    description: '진행에 필요한 확인사항과 실행 조건을 정리한다.',
+    priority: 'normal',
+  },
+};
+
+interface DelegateTaskDraft {
+  title: string;
+  description: string;
+  agentId: string;
+  priority: TaskPriority;
+  dueAt?: string | null;
+  required?: boolean;
+}
+
+function getCeoPlanningModel(): string {
+  const ceoModel = (vscode.workspace.getConfiguration('connectAiLab').get<string>('ceoModel') || '').trim();
+  return ceoModel || getConfig().defaultModel || '';
+}
+
+function buildDelegateTelegramSystemPrompt(): string {
+  const brainContext = buildCeoTelegramBrainContext();
+  return [
+    `[Connect AI /delegate planner]`,
+    `You are the CEO task planner for tracker registration only.`,
+    `Break one big goal into 1-5 tracker tasks, not agent execution.`,
+    `If the user's input is Korean, every task title and description must also be Korean.`,
+    `Return JSON only. No markdown. No prose. No code fences. No commentary.`,
+    `Do not execute anything. Do not call tools. Do not mention run_command, create_file, edit_file, Python, API, YouTube, Leo.`,
+    `Use the brain context below. If evidence is weak, keep the task small and conservative.`,
+    `Allowed agentId values: researcher, business, writer, developer, ceo, secretary.`,
+    `If uncertain about agentId, fall back to ceo.`,
+    `Required task fields: title, description, agentId, priority.`,
+    `Optional field: dueAt (ISO 8601 or null).`,
+    `Max task count: 5.`,
+    `Output schema: {"summary":"...", "tasks":[{"title":"...","description":"...","agentId":"researcher","priority":"normal","dueAt":null}]}`,
+    `Role responsibilities:`,
+    `- Researcher: 시장, 고객, 주제, 경쟁/사례 조사`,
+    `- Business: 상품 구조, 가격 전략, 수익 모델, 운영 방식`,
+    `- Writer: 모집글, 상세페이지, 커리큘럼 초안, 홍보 문구`,
+    `- Developer: 자동화/도구/웹/시스템 구현이 필요한 경우만`,
+    `- CEO: 최종 실행계획, 우선순위, 의사결정, 조율`,
+    `If the goal includes a course, pilot, monetization, pricing, launch, or sales plan, include at least one business task.`,
+    `If the goal includes recruitment, landing page, curriculum, or promotional copy, include at least one writer task.`,
+    `CEO tasks must be coordination / execution-plan tasks only, never design, writing, posting, or production tasks.`,
+    `If a task looks like design, creation, posting, or production, do not keep it as a CEO task.`,
+    `When the input includes a timeframe like "2주", "7일", or "이번 주", set at least one dueAt close to the deadline when safely inferable.`,
+    `If dueAt is not safely inferable, leave it null rather than guessing.`,
+    `Use Korean task titles. Keep titles short and concrete.`,
+    `Keep descriptions in Korean and action-oriented.`,
+    `Brain context priority is identity > goals > decisions > tracker > sessions(reference only) > conversations.`,
+    `Sessions are reference only and must not override decisions/goals/identity.`,
+    `If evidence is insufficient, still keep output grounded and conservative.`,
+    '',
+    `[brain context]`,
+    brainContext || '(empty)',
+  ].join('\n');
+}
+
+function _delegateNormalizeAgentId(v: unknown): string {
+  const raw = typeof v === 'string' ? v.trim().toLowerCase() : '';
+  return DELEGATE_ALLOWED_AGENT_IDS.has(raw) ? raw : 'ceo';
+}
+
+function _delegateNormalizeDueAt(v: unknown): string | undefined {
+  if (typeof v !== 'string') return undefined;
+  const raw = v.trim();
+  if (!raw || raw.toLowerCase() === 'null') return undefined;
+  const ms = Date.parse(raw);
+  if (!isFinite(ms)) return undefined;
+  return new Date(ms).toISOString();
+}
+
+function _delegateInferDueAtFromGoal(goal: string): string | undefined {
+  const s = goal.trim();
+  if (!s) return undefined;
+  const now = new Date();
+  const addDays = (days: number) => {
+    const d = new Date(now.getTime());
+    d.setDate(d.getDate() + days);
+    return d.toISOString();
+  };
+  if (/2주|두\s*주/.test(s)) return addDays(14);
+  if (/7일|일주일|이번\s*주|이번주/.test(s)) return addDays(7);
+  if (/3일/.test(s)) return addDays(3);
+  if (/1주/.test(s)) return addDays(7);
+  return undefined;
+}
+
+function _delegateNormalizePriority(v: unknown): TaskPriority {
+  if (v === 'urgent' || v === 'high' || v === 'normal' || v === 'low') return v;
+  return 'normal';
+}
+
+function _delegateHasHangul(text: string): boolean {
+  return DELEGATE_KOREAN_RE.test(text || '');
+}
+
+function _delegateGoalNeedsBusiness(goal: string): boolean {
+  return DELEGATE_BUSINESS_GOAL_RE.test(goal || '');
+}
+
+function _delegateGoalNeedsWriter(goal: string): boolean {
+  return DELEGATE_WRITER_GOAL_RE.test(goal || '');
+}
+
+function _delegateGoalUsesCoursePilotTemplate(goal: string): boolean {
+  return DELEGATE_TEMPLATE_GOAL_RE.test(goal || '');
+}
+
+function _delegateHasSemanticOverlap(a: string, b: string): boolean {
+  const left = (a || '').toLowerCase();
+  const right = (b || '').toLowerCase();
+  const buckets = [
+    ['5060', '5060'],
+    ['강의', '강의'],
+    ['사업', '사업'],
+    ['파일럿', '파일럿'],
+    ['모집', '모집'],
+    ['모집글', '모집글'],
+    ['수익화', '수익화'],
+    ['가격', '가격'],
+    ['상품', '상품'],
+    ['주제', '주제'],
+    ['조사', '조사'],
+    ['리서치', '리서치'],
+    ['반응', '반응'],
+    ['시장', '시장'],
+    ['고객', '고객'],
+    ['경쟁', '경쟁'],
+    ['사례', '사례'],
+    ['커리큘럼', '커리큘럼'],
+    ['실행계획', '실행계획'],
+    ['우선순위', '우선순위'],
+    ['일정', '일정'],
+  ];
+  let score = 0;
+  for (const [k] of buckets) {
+    if (left.includes(k) && right.includes(k)) score++;
+  }
+  return score >= 2;
+}
+
+function _delegateDefaultTaskFor(agentId: string): DelegateTaskDraft {
+  const defaults = DELEGATE_ROLE_DEFAULTS[agentId] || DELEGATE_ROLE_DEFAULTS.ceo;
+  return {
+    title: defaults.title,
+    description: defaults.description,
+    agentId: DELEGATE_ALLOWED_AGENT_IDS.has(agentId) ? agentId : 'ceo',
+    priority: defaults.priority,
+  };
+}
+
+function _delegateTemplateTasks(goal: string, dueAt?: string): DelegateTaskDraft[] {
+  const inferredDueAt = dueAt || _delegateInferDueAtFromGoal(goal) || undefined;
+  return [
+    {
+      ..._delegateDefaultTaskFor('researcher'),
+      priority: 'high',
+      dueAt: inferredDueAt,
+      required: true,
+    },
+    {
+      ..._delegateDefaultTaskFor('business'),
+      priority: 'high',
+      dueAt: inferredDueAt,
+      required: true,
+    },
+    {
+      ..._delegateDefaultTaskFor('writer'),
+      priority: 'high',
+      dueAt: inferredDueAt,
+      required: true,
+    },
+    {
+      ..._delegateDefaultTaskFor('ceo'),
+      priority: 'high',
+      dueAt: inferredDueAt,
+      required: true,
+    },
+  ];
+}
+
+function _delegateOpenTaskTitles(): Set<string> {
+  const titles = new Set<string>();
+  for (const task of listOpenTrackerTasks()) {
+    const title = (task.title || '').trim().toLowerCase();
+    if (title) titles.add(title);
+  }
+  return titles;
+}
+
+function _delegateHasOpenDuplicateTitle(title: string): boolean {
+  const needle = (title || '').trim().toLowerCase();
+  if (!needle) return true;
+  return _delegateOpenTaskTitles().has(needle);
+}
+
+function _delegateLooksLikePostingTask(text: string): boolean {
+  return DELEGATE_POSTING_RE.test(text || '');
+}
+
+function _delegateLooksLikeUnsafeCeoTask(text: string): boolean {
+  return DELEGATE_CEO_UNSAFE_RE.test(text || '') && !DELEGATE_CEO_COORDINATION_RE.test(text || '');
+}
+
+function _delegateShouldUseDefaultLanguage(goal: string, text: string): boolean {
+  return _delegateHasHangul(goal) && !DELEGATE_KOREAN_RE.test(text || '');
+}
+
+function _delegateRewriteSafeTask(task: DelegateTaskDraft, goal: string, inferredDueAt?: string): DelegateTaskDraft | null {
+  const cleanGoal = (goal || '').trim();
+  const combined = `${task.title}\n${task.description}`;
+  let agentId = _delegateNormalizeAgentId(task.agentId);
+  let title = task.title.trim();
+  let description = task.description.trim();
+  let priority = task.priority;
+
+  if (_delegateLooksLikePostingTask(combined)) {
+    agentId = 'business';
+    title = '모집 채널 후보와 게시 일정 정리';
+    description = '모집글과 상품 구조를 확인한 뒤 게시 채널과 시점을 검토한다.';
+    priority = priority === 'urgent' ? 'urgent' : 'high';
+  } else if (agentId === 'ceo' && _delegateLooksLikeUnsafeCeoTask(combined)) {
+    if (/(디자인|홍보|문구|모집글|상세페이지|커리큘럼|visual|promotional)/i.test(combined)) {
+      agentId = 'writer';
+      title = DELEGATE_ROLE_DEFAULTS.writer.title;
+      description = DELEGATE_ROLE_DEFAULTS.writer.description;
+      priority = priority === 'urgent' ? 'urgent' : 'normal';
+    } else {
+      title = DELEGATE_ROLE_DEFAULTS.ceo.title;
+      description = DELEGATE_ROLE_DEFAULTS.ceo.description;
+      priority = priority === 'urgent' ? 'urgent' : 'high';
+    }
+  } else if (_delegateShouldUseDefaultLanguage(cleanGoal, title) || _delegateShouldUseDefaultLanguage(cleanGoal, description)) {
+    const defaults = DELEGATE_ROLE_DEFAULTS[agentId] || DELEGATE_ROLE_DEFAULTS.ceo;
+    title = defaults.title;
+    description = defaults.description;
+    priority = defaults.priority;
+  }
+
+  if (!title || !description) return null;
+  const dueAt = _delegateNormalizeDueAt(task.dueAt) || inferredDueAt || undefined;
+  return {
+    title: title.slice(0, 120),
+    description: description.slice(0, 1000),
+    agentId: DELEGATE_ALLOWED_AGENT_IDS.has(agentId) ? agentId : 'ceo',
+    priority,
+    dueAt,
+  };
+}
+
+function _delegateSortTasks(tasks: DelegateTaskDraft[]): DelegateTaskDraft[] {
+  const order = new Map<string, number>(DELEGATE_ROLE_ORDER.map((id, idx) => [id, idx]));
+  return [...tasks].sort((a, b) => {
+    const aIdx = order.has(a.agentId) ? (order.get(a.agentId) as number) : 99;
+    const bIdx = order.has(b.agentId) ? (order.get(b.agentId) as number) : 99;
+    if (aIdx !== bIdx) return aIdx - bIdx;
+    const aPri = a.priority === 'urgent' ? 0 : a.priority === 'high' ? 1 : a.priority === 'normal' ? 2 : 3;
+    const bPri = b.priority === 'urgent' ? 0 : b.priority === 'high' ? 1 : b.priority === 'normal' ? 2 : 3;
+    if (aPri !== bPri) return aPri - bPri;
+    return (a.title || '').localeCompare(b.title || 'ko');
+  });
+}
+
+function _delegateNormalizeTasks(goal: string, parsed: { summary?: string; tasks: DelegateTaskDraft[] }): { summary?: string; tasks: DelegateTaskDraft[] } {
+  const inferredDueAt = _delegateInferDueAtFromGoal(goal);
+  const cleanGoal = (goal || '').trim();
+  const goalHasKorean = _delegateHasHangul(cleanGoal);
+  const templateMode = _delegateGoalUsesCoursePilotTemplate(cleanGoal);
+
+  if (templateMode) {
+    const result: DelegateTaskDraft[] = _delegateTemplateTasks(cleanGoal, inferredDueAt);
+    const seenTitles = new Set(result.map(t => t.title.trim().toLowerCase()));
+
+    for (const task of parsed.tasks.slice(0, 5)) {
+      const normalized = _delegateRewriteSafeTask(task, cleanGoal, inferredDueAt);
+      if (!normalized) continue;
+      const title = normalized.title.trim();
+      const description = normalized.description.trim();
+      if (!title || !description) continue;
+      if (goalHasKorean && (!DELEGATE_KOREAN_RE.test(title) || !DELEGATE_KOREAN_RE.test(description))) continue;
+      const combined = `${title}\n${description}`;
+      if (_delegateLooksLikePostingTask(combined) || _delegateLooksLikeUnsafeCeoTask(combined)) continue;
+      if (!['developer', 'secretary'].includes(_delegateNormalizeAgentId(normalized.agentId))) continue;
+      if (_delegateHasSemanticOverlap(combined, `${result.map(t => `${t.title}\n${t.description}`).join('\n')}`)) continue;
+      const key = title.toLowerCase();
+      if (!key || seenTitles.has(key)) continue;
+      if (result.length >= 5) break;
+      result.push({
+        title: title.slice(0, 120),
+        description: description.slice(0, 1000),
+        agentId: _delegateNormalizeAgentId(normalized.agentId),
+        priority: _delegateNormalizePriority(normalized.priority),
+        dueAt: _delegateNormalizeDueAt(normalized.dueAt) || inferredDueAt || undefined,
+        required: false,
+      });
+      seenTitles.add(key);
+    }
+
+    return {
+      summary: parsed.summary,
+      tasks: result.slice(0, 5),
+    };
+  }
+
+  const result: DelegateTaskDraft[] = [];
+  const seenRoles = new Set<string>();
+  const seenTitles = new Set<string>();
+
+  for (const task of parsed.tasks.slice(0, 5)) {
+    const normalized = _delegateRewriteSafeTask(task, cleanGoal, inferredDueAt);
+    if (!normalized) continue;
+    if (goalHasKorean && (!DELEGATE_KOREAN_RE.test(normalized.title) || !DELEGATE_KOREAN_RE.test(normalized.description))) {
+      const fallback = _delegateDefaultTaskFor(normalized.agentId);
+      normalized.title = fallback.title;
+      normalized.description = fallback.description;
+      if (!normalized.priority) normalized.priority = fallback.priority;
+    }
+    const title = normalized.title.trim();
+    const description = normalized.description.trim();
+    if (!title || !description) continue;
+    normalized.title = title;
+    normalized.description = description;
+    normalized.dueAt = normalized.dueAt || inferredDueAt || undefined;
+    const key = title.toLowerCase();
+    if (seenTitles.has(key)) continue;
+    result.push(normalized);
+    seenTitles.add(key);
+    seenRoles.add(normalized.agentId);
+  }
+
+  const shouldAddBusiness = _delegateGoalNeedsBusiness(cleanGoal);
+  const shouldAddWriter = true;
+  const shouldAddResearcher = true;
+  const shouldAddCeo = true;
+
+  if (shouldAddResearcher && !seenRoles.has('researcher')) {
+    const fallback = _delegateDefaultTaskFor('researcher');
+    fallback.dueAt = inferredDueAt || undefined;
+    if (!seenTitles.has(fallback.title.trim().toLowerCase())) {
+      result.push({ ...fallback, required: true });
+      seenTitles.add(fallback.title.trim().toLowerCase());
+    }
+    seenRoles.add('researcher');
+  }
+  if (shouldAddBusiness && !seenRoles.has('business')) {
+    const fallback = _delegateDefaultTaskFor('business');
+    fallback.dueAt = inferredDueAt || undefined;
+    if (!seenTitles.has(fallback.title.trim().toLowerCase())) {
+      result.push({ ...fallback, required: true });
+      seenTitles.add(fallback.title.trim().toLowerCase());
+    }
+    seenRoles.add('business');
+  }
+  if (shouldAddWriter && !seenRoles.has('writer')) {
+    const fallback = _delegateDefaultTaskFor('writer');
+    fallback.dueAt = inferredDueAt || undefined;
+    if (!seenTitles.has(fallback.title.trim().toLowerCase())) {
+      result.push({ ...fallback, required: true });
+      seenTitles.add(fallback.title.trim().toLowerCase());
+    }
+    seenRoles.add('writer');
+  }
+  if (shouldAddCeo && !seenRoles.has('ceo')) {
+    const fallback = _delegateDefaultTaskFor('ceo');
+    fallback.dueAt = inferredDueAt || undefined;
+    if (!seenTitles.has(fallback.title.trim().toLowerCase())) {
+      result.push({ ...fallback, required: true });
+      seenTitles.add(fallback.title.trim().toLowerCase());
+    }
+    seenRoles.add('ceo');
+  }
+
+  const prioritized = _delegateSortTasks(result);
+  const unique: DelegateTaskDraft[] = [];
+  const titles = new Set<string>();
+  for (const task of prioritized) {
+    const key = task.title.trim().toLowerCase();
+    if (!key || titles.has(key)) continue;
+    titles.add(key);
+    unique.push({
+      title: task.title.slice(0, 120),
+      description: task.description.slice(0, 1000),
+      agentId: _delegateNormalizeAgentId(task.agentId),
+      priority: _delegateNormalizePriority(task.priority),
+      dueAt: _delegateNormalizeDueAt(task.dueAt) || inferredDueAt || undefined,
+      required: !!task.required,
+    });
+    if (unique.length >= 5) break;
+  }
+
+  return {
+    summary: parsed.summary,
+    tasks: unique,
+  };
+}
+
+function _delegateHasDuplicateTitle(title: string): boolean {
+  return _delegateHasOpenDuplicateTitle(title);
+}
+
+function _delegateParsePlan(raw: string): { summary?: string; tasks: DelegateTaskDraft[] } | null {
+  const parsed = _extractFirstJsonObject(raw);
+  if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.tasks)) return null;
+  const tasks: DelegateTaskDraft[] = [];
+  for (const item of parsed.tasks.slice(0, 5)) {
+    if (!item || typeof item !== 'object') continue;
+    const title = typeof item.title === 'string' ? item.title.trim() : '';
+    const description = typeof item.description === 'string' ? item.description.trim() : '';
+    if (!title || !description) continue;
+    tasks.push({
+      title: title.slice(0, 120),
+      description: description.slice(0, 1000),
+      agentId: _delegateNormalizeAgentId((item as any).agentId),
+      priority: _delegateNormalizePriority((item as any).priority),
+      dueAt: _delegateNormalizeDueAt((item as any).dueAt),
+    });
+  }
+  if (tasks.length === 0) return null;
+  const summary = typeof (parsed as any).summary === 'string' ? String((parsed as any).summary).trim() : '';
+  return { summary: summary.slice(0, 500) || undefined, tasks };
 }
 
 function sanitizeCeoTelegramText(text: string): string {
