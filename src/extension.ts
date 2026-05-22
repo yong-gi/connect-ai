@@ -1,4 +1,4 @@
-import * as vscode from 'vscode';
+﻿import * as vscode from 'vscode';
 import * as http from 'http';
 import axios from 'axios';
 import * as fs from 'fs';
@@ -2199,6 +2199,27 @@ async function handleTelegramCommand(text: string): Promise<void> {
         await sendTelegramLong(liveReport);
         return;
     }
+    if (cmd === '/plan') {
+        const argPlan = rest.trim();
+        const planId = argPlan ? _delegateFindPlanIdArg(argPlan) : _delegateSelectPlanId();
+        if (!planId) {
+            await sendTelegramReport('표시할 planId를 찾지 못했어요. 먼저 `/delegate`로 플랜을 등록해 주세요.');
+            return;
+        }
+        const tasks = readTracker().tasks.filter(t => (t.planId || '').trim() === planId);
+        if (tasks.length === 0) {
+            await sendTelegramReport(`planId \`${planId}\` 에 해당하는 작업을 찾지 못했어요.`);
+            return;
+        }
+        tasks.sort((a, b) => {
+            const sa = _delegatePlanStageSortValue(a.stage);
+            const sb = _delegatePlanStageSortValue(b.stage);
+            if (sa !== sb) return sa - sb;
+            return new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime();
+        });
+        await sendTelegramLong(_delegateFormatPlan(planId, tasks));
+        return;
+    }
     if (cmd === '/ceo') {
         const question = rest.trim();
         if (!question) {
@@ -2227,23 +2248,32 @@ async function handleTelegramCommand(text: string): Promise<void> {
         try {
             const systemPrompt = buildDelegateTelegramSystemPrompt();
             const model = getCeoPlanningModel();
+            const planId = _delegateNewPlanId();
+            const isTemplatePlan = _delegateIsCoursePilotTemplateGoal(goal);
             const raw = await _quickLLMCall(systemPrompt, goal, 720, { model });
             const parsed = _delegateParsePlan(raw);
-            if (!parsed || !Array.isArray(parsed.tasks) || parsed.tasks.length === 0) {
+            if (!isTemplatePlan && (!parsed || !Array.isArray(parsed.tasks) || parsed.tasks.length === 0)) {
                 const preview = sanitizeCeoTelegramText(raw).trim().slice(0, 1500) || '(미리보기 없음)';
                 await sendTelegramLong(`❗ *작업 등록 실패 / 계획 미리보기*\n\n${preview}\n\n_추가로 등록은 하지 않았어요._`);
                 return;
             }
 
-            const planned = _delegateNormalizeTasks(goal, parsed);
+            const planned = isTemplatePlan
+                ? { summary: parsed?.summary || goal, tasks: _delegateTemplateTasks(goal) }
+                : _delegateNormalizeTasks(goal, parsed);
             const created: TrackerTask[] = [];
             const skipped: string[] = [];
+            const createdByRef = new Map<string, string>();
             for (const task of planned.tasks.slice(0, 5)) {
-                if (!task.required && _delegateHasDuplicateTitle(task.title)) {
+                if (!isTemplatePlan && !task.required && _delegateHasDuplicateTitle(task.title)) {
                     skipped.push(task.title);
                     continue;
                 }
-                const taskOwner: TrackerTask['owner'] = 'agent';
+                const resolvedDependsOn = Array.isArray(task.dependsOn) ? task.dependsOn
+                    .map(d => (typeof d === 'string' ? d.trim() : ''))
+                    .filter(Boolean)
+                    .map(ref => createdByRef.get(ref.toLowerCase()) || ref)
+                    .filter(Boolean) : undefined;
                 const createdTask = addTrackerTask({
                     title: task.title,
                     description: [
@@ -2251,13 +2281,17 @@ async function handleTelegramCommand(text: string): Promise<void> {
                         `\n[delegate goal] ${goal.slice(0, 400)}`,
                         planned.summary ? `[delegate summary] ${planned.summary}` : ''
                     ].filter(Boolean).join('\n').trim().slice(0, 1000),
-                    owner: taskOwner,
+                    owner: 'agent',
                     agentIds: [task.agentId],
                     status: 'pending',
                     priority: task.priority,
                     dueAt: task.dueAt || undefined,
+                    planId,
+                    stage: task.stage,
+                    dependsOn: resolvedDependsOn,
                 });
                 created.push(createdTask);
+                createdByRef.set((task.key || task.agentId || task.title).trim().toLowerCase(), createdTask.id);
             }
 
             if (created.length === 0) {
@@ -2275,12 +2309,17 @@ async function handleTelegramCommand(text: string): Promise<void> {
                 const a = AGENTS[(task.agentIds && task.agentIds[0]) || 'ceo'] || AGENTS.ceo;
                 lines.push(`- ${a.emoji} ${a.name}: \`${task.id.slice(-9)}\` ${task.title}`);
             }
+            lines.push('');
+            lines.push(`planId: \`${planId}\``);
             if (skipped.length > 0) {
                 lines.push('');
                 lines.push(`_중복 제목으로 제외: ${skipped.length}개_`);
             }
             lines.push('');
-            lines.push('다음 확인: `/queue`, `/progress <id>`');
+            lines.push('다음 확인:');
+            lines.push('- `/plan` : 실행 흐름 보기');
+            lines.push('- `/queue` : 등록 작업 목록 보기');
+            lines.push('- `/progress <id>` : 작업 상세 보기');
             await sendTelegramLong(lines.join('\n'));
         } catch (e: any) {
             await sendTelegramReport(`작업 분해 중 오류가 발생했어요: ${e?.message || e}`);
@@ -4077,6 +4116,11 @@ interface TrackerTask {
   evidence?: string;
   calendarEventId?: string; /* Google Calendar event id (when auto-created) */
   priority?: TaskPriority; /* added v2.78 — defaults to 'normal' on read */
+  planId?: string;
+  stage?: number | string;
+  dependsOn?: string[];
+  resultPath?: string;
+  resultSummary?: string;
   /* P1-6: recurrence — when set, the task is a template that auto-spawns
      fresh copies after each completion. cadence is a simple semantic key,
      nextRunAt is computed by the recurrence loop. */
@@ -4574,6 +4618,17 @@ function _trackerNewId(): string {
   return `${stamp}-${rand}`;
 }
 
+function _delegateNewPlanId(): string {
+  const stamp = new Date().toISOString().replace(/[-:T.]/g, '').slice(0, 14);
+  const rand = Math.random().toString(36).slice(2, 6);
+  return `delegate-${stamp}-${rand}`;
+}
+
+function _delegateIsCoursePilotTemplateGoal(goal: string): boolean {
+  const s = (goal || '').trim();
+  return /5060/.test(s) && /AI/i.test(s) && /(강의|수익화|파일럿|모집글)/.test(s);
+}
+
 function addTrackerTask(partial: Partial<TrackerTask> & { title: string; owner: TrackerTask['owner'] }): TrackerTask {
   const t = readTracker();
   const task: TrackerTask = {
@@ -4588,6 +4643,11 @@ function addTrackerTask(partial: Partial<TrackerTask> & { title: string; owner: 
     sessionDir: partial.sessionDir,
     nudges: 0,
     priority: _coercePriority(partial.priority),
+    planId: typeof partial.planId === 'string' ? partial.planId.trim() || undefined : undefined,
+    stage: partial.stage,
+    dependsOn: Array.isArray(partial.dependsOn) ? partial.dependsOn.map(d => typeof d === 'string' ? d.trim() : '').filter(Boolean) : undefined,
+    resultPath: typeof partial.resultPath === 'string' ? partial.resultPath.trim() || undefined : undefined,
+    resultSummary: typeof partial.resultSummary === 'string' ? partial.resultSummary.trim() || undefined : undefined,
     recurrence: partial.recurrence,
     nextRunAt: partial.nextRunAt,
     preAlarmsSent: partial.preAlarmsSent || [],
@@ -4614,6 +4674,77 @@ function addTrackerTask(partial: Partial<TrackerTask> & { title: string; owner: 
     }).catch(() => { /* silent — calendar errors shouldn't break tracker */ });
   }
   return task;
+}
+
+function _delegatePlanStageSortValue(stage: number | string | undefined): number {
+  if (typeof stage === 'number' && isFinite(stage)) return stage;
+  if (typeof stage === 'string') {
+    const n = parseInt(stage, 10);
+    if (isFinite(n)) return n;
+  }
+  return Number.MAX_SAFE_INTEGER;
+}
+
+function _delegateFindPlanIdArg(arg: string): string | null {
+  const needle = (arg || '').trim();
+  if (!needle) return null;
+  const plans = Array.from(new Set(readTracker().tasks.map(t => (t.planId || '').trim()).filter(Boolean)));
+  return plans.find(p => p === needle) || plans.find(p => p.endsWith(needle)) || null;
+}
+
+function _delegateSelectPlanId(): string | null {
+  const all = readTracker().tasks.filter(t => (t.planId || '').trim());
+  if (all.length === 0) return null;
+  const open = all.filter(t => t.status !== 'done' && t.status !== 'cancelled');
+  const pool = open.length > 0 ? open : all;
+  pool.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+  return pool[0].planId || null;
+}
+
+function _delegateFormatPlan(planId: string, tasks: TrackerTask[]): string {
+  const byId = new Map(tasks.map(t => [t.id, t]));
+  const title = (() => {
+    const first = tasks[0];
+    if (!first) return '실행 플랜';
+    const desc = first.description || '';
+    const m = desc.match(/^\[delegate goal\]\s*(.+)$/m);
+    return (m && m[1].trim()) ? m[1].trim() : first.title;
+  })();
+  const stageGroups = new Map<string, TrackerTask[]>();
+  for (const task of tasks) {
+    const stageKey = String(task.stage ?? '미지정');
+    const group = stageGroups.get(stageKey) || [];
+    group.push(task);
+    stageGroups.set(stageKey, group);
+  }
+
+  const lines: string[] = [];
+  lines.push(`실행 플랜: ${title}`);
+  lines.push(`planId: ${planId}`);
+  lines.push('');
+
+  for (const stageKey of Array.from(stageGroups.keys()).sort((a, b) => _delegatePlanStageSortValue(a) - _delegatePlanStageSortValue(b))) {
+    const stageTasks = stageGroups.get(stageKey) || [];
+    const ready = stageTasks.filter(t => {
+      const deps = Array.isArray(t.dependsOn) ? t.dependsOn : [];
+      if (deps.length === 0) return true;
+      return deps.every(id => (byId.get(id)?.status === 'done'));
+    });
+    const header = stageTasks.every(t => t.status === 'done' || t.status === 'cancelled')
+      ? '완료'
+      : ready.length > 0 ? '바로 실행 가능' : '대기';
+    lines.push(stageKey === '미지정' ? `미지정 단계 — ${header}` : `${stageKey}단계 — ${header}`);
+    for (const task of stageTasks) {
+      const a = (task.agentIds && task.agentIds[0]) ? AGENTS[task.agentIds[0]] : null;
+      const ownerLabel = a ? a.name : (task.agentIds && task.agentIds[0]) || 'Unknown';
+      const icon = task.status === 'done' ? '✅' : task.status === 'cancelled' ? '⛔' : '•';
+      lines.push(`- ${icon} ${ownerLabel} ${task.id.slice(-9)} ${task.title}`);
+      const deps = Array.isArray(task.dependsOn) ? task.dependsOn.filter(Boolean) : [];
+      if (deps.length > 0) lines.push(`  의존: ${deps.map(id => id.slice(-9)).join(', ')}`);
+    }
+    lines.push('');
+  }
+  return lines.join('\n').trim();
 }
 
 function updateTrackerTask(id: string, patch: Partial<TrackerTask>): TrackerTask | null {
@@ -7653,6 +7784,10 @@ interface DelegateTaskDraft {
   priority: TaskPriority;
   dueAt?: string | null;
   required?: boolean;
+  stage?: number | string;
+  dependsOn?: string[];
+  key?: string;
+  dependencyKey?: string;
 }
 
 function getCeoPlanningModel(): string {
@@ -7800,24 +7935,34 @@ function _delegateTemplateTasks(goal: string, dueAt?: string): DelegateTaskDraft
       ..._delegateDefaultTaskFor('researcher'),
       priority: 'high',
       dueAt: inferredDueAt,
+      stage: 1,
+      key: 'researcher',
       required: true,
     },
     {
       ..._delegateDefaultTaskFor('business'),
       priority: 'high',
       dueAt: inferredDueAt,
+      stage: 1,
+      key: 'business',
       required: true,
     },
     {
       ..._delegateDefaultTaskFor('writer'),
       priority: 'high',
       dueAt: inferredDueAt,
+      stage: 2,
+      key: 'writer',
+      dependsOn: ['researcher', 'business'],
       required: true,
     },
     {
       ..._delegateDefaultTaskFor('ceo'),
       priority: 'high',
       dueAt: inferredDueAt,
+      stage: 3,
+      key: 'ceo',
+      dependsOn: ['writer'],
       required: true,
     },
   ];
@@ -7889,6 +8034,10 @@ function _delegateRewriteSafeTask(task: DelegateTaskDraft, goal: string, inferre
     agentId: DELEGATE_ALLOWED_AGENT_IDS.has(agentId) ? agentId : 'ceo',
     priority,
     dueAt,
+    stage: task.stage,
+    dependsOn: task.dependsOn,
+    key: task.key,
+    dependencyKey: task.dependencyKey,
   };
 }
 
@@ -7936,6 +8085,10 @@ function _delegateNormalizeTasks(goal: string, parsed: { summary?: string; tasks
         priority: _delegateNormalizePriority(normalized.priority),
         dueAt: _delegateNormalizeDueAt(normalized.dueAt) || inferredDueAt || undefined,
         required: false,
+        stage: normalized.stage,
+        dependsOn: normalized.dependsOn,
+        key: normalized.key,
+        dependencyKey: normalized.dependencyKey,
       });
       seenTitles.add(key);
     }
@@ -8028,6 +8181,10 @@ function _delegateNormalizeTasks(goal: string, parsed: { summary?: string; tasks
       priority: _delegateNormalizePriority(task.priority),
       dueAt: _delegateNormalizeDueAt(task.dueAt) || inferredDueAt || undefined,
       required: !!task.required,
+      stage: task.stage,
+      dependsOn: task.dependsOn,
+      key: task.key,
+      dependencyKey: task.dependencyKey,
     });
     if (unique.length >= 5) break;
   }
@@ -8057,6 +8214,10 @@ function _delegateParsePlan(raw: string): { summary?: string; tasks: DelegateTas
       agentId: _delegateNormalizeAgentId((item as any).agentId),
       priority: _delegateNormalizePriority((item as any).priority),
       dueAt: _delegateNormalizeDueAt((item as any).dueAt),
+      stage: (item as any).stage,
+      dependsOn: Array.isArray((item as any).dependsOn) ? (item as any).dependsOn : undefined,
+      key: typeof (item as any).key === 'string' ? String((item as any).key).trim().slice(0, 80) : undefined,
+      dependencyKey: typeof (item as any).dependencyKey === 'string' ? String((item as any).dependencyKey).trim().slice(0, 80) : undefined,
     });
   }
   if (tasks.length === 0) return null;
