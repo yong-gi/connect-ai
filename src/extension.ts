@@ -2167,6 +2167,60 @@ async function handleTelegramCommand(text: string): Promise<void> {
         await sendTelegramLong(formatTrackerTaskProgress(match));
         return;
     }
+    if (cmd === '/result') {
+        const idArg = rest.trim();
+        if (!idArg) {
+            await sendTelegramReport('사용법: `/result <id>`\n예: `/result 5121-tnmo`');
+            return;
+        }
+        const match = findTrackerTaskByIdArg(idArg);
+        if (!match) {
+            await sendTelegramReport(`작업을 찾지 못했어요: \`${idArg}\`\n사용법: \`/result <id>\`\n예: \`/result 5121-tnmo\``);
+            return;
+        }
+
+        const header = formatTrackerTaskResult(match);
+        await sendTelegramLong(header);
+
+        if (match.status === 'pending') {
+            await sendTelegramReport(
+                `아직 실행되지 않은 작업이에요.\n` +
+                `- 실행: \`/run-safe ${match.id.slice(-9)}\` 또는 \`/run-ready\``
+            );
+            return;
+        }
+
+        if (match.status === 'failed') {
+            const evidence = (match.evidence || '').trim();
+            const failedText = [
+                `⚠️ *실패 상태*`,
+                evidence ? `- evidence: ${evidence}` : '- evidence: (없음)',
+            ].join('\n');
+            await sendTelegramLong(failedText);
+        }
+
+        const resultPathText = (match.resultPath || '').trim();
+        if (resultPathText) {
+            const fileResult = _trackerTaskResultFileContent(match);
+            if (fileResult.ok && fileResult.text !== undefined) {
+                const fileText = _truncateResultText(fileResult.text);
+                await sendTelegramLong(
+                    `*결과 파일 내용*\n` +
+                    `- resultPath: ${_trackerTaskResultPathText(match)}\n\n` +
+                    fileText
+                );
+                return;
+            }
+        }
+
+        const fallbackText = formatTrackerTaskResultFallback(match);
+        await sendTelegramLong(
+            `*결과 파일을 읽지 못했어요.*\n` +
+            `- resultPath: ${_trackerTaskResultPathText(match)}\n\n` +
+            fallbackText
+        );
+        return;
+    }
     if (cmd === '/run-safe') {
         const idArg = rest.trim();
         if (!idArg) {
@@ -4935,6 +4989,80 @@ function formatTrackerTaskProgress(task: TrackerTask): string {
     `- createdAt: ${createdAt}`,
     `- evidence: ${evidence}`,
   ].join('\n');
+}
+
+function _trackerTaskResultPathText(task: TrackerTask): string {
+  const resultPath = (task.resultPath || '').trim();
+  if (!resultPath) return '(없음)';
+  return resultPath.replace(/\\/g, '/');
+}
+
+function _trackerTaskAgentIdsText(task: TrackerTask): string {
+  return Array.isArray(task.agentIds) && task.agentIds.length > 0
+    ? task.agentIds.join(', ')
+    : '(없음)';
+}
+
+function _trackerTaskResultFileContent(task: TrackerTask): { ok: boolean; text?: string; error?: string } {
+  const rawPath = (task.resultPath || '').trim();
+  if (!rawPath) return { ok: false, error: 'no resultPath' };
+  const companyDir = getCompanyDir();
+  const absPath = path.isAbsolute(rawPath) ? rawPath : path.resolve(companyDir, rawPath);
+  try {
+    if (!fs.existsSync(absPath)) return { ok: false, error: 'file missing' };
+    const stat = fs.statSync(absPath);
+    if (!stat.isFile()) return { ok: false, error: 'not a file' };
+    const text = fs.readFileSync(absPath, 'utf-8');
+    return { ok: true, text };
+  } catch (e: any) {
+    return { ok: false, error: e?.message || String(e) };
+  }
+}
+
+function formatTrackerTaskResult(task: TrackerTask): string {
+  const agentIds = _trackerTaskAgentIdsText(task);
+  const resultSummary = (task.resultSummary || '').trim() || '(없음)';
+  const resultPath = _trackerTaskResultPathText(task);
+  const evidence = (task.evidence || '').trim().replace(/\s+/g, ' ') || '(없음)';
+
+  return [
+    `📄 *작업 결과*`,
+    `- 제목: ${task.title}`,
+    `- id: \`${task.id.slice(-9)}\``,
+    `- status: ${task.status}`,
+    `- agentIds: ${agentIds}`,
+    `- resultSummary: ${resultSummary}`,
+    `- resultPath: ${resultPath}`,
+    `- evidence: ${evidence}`,
+  ].join('\n');
+}
+
+function formatTrackerTaskResultFallback(task: TrackerTask): string {
+  const resultSummary = (task.resultSummary || '').trim();
+  const evidence = (task.evidence || '').trim().replace(/\s+/g, ' ');
+  if (resultSummary) {
+    return [
+      `*resultSummary*`,
+      resultSummary,
+      '',
+      `*evidence*`,
+      evidence || '(없음)',
+    ].join('\n');
+  }
+  if (evidence) {
+    return [
+      `*evidence*`,
+      evidence,
+    ].join('\n');
+  }
+  return '아직 저장된 결과가 없어요.';
+}
+
+function _truncateResultText(text: string, maxLen = 12000): string {
+  const s = (text || '').trim();
+  if (s.length <= maxLen) return s;
+  const head = s.slice(0, Math.floor(maxLen * 0.75));
+  return `${head}\n\n... (중략: ${s.length - head.length}자 더 있음) ...`;
 }
 
 function _runSafeAllowedAgentId(task: TrackerTask): string {
