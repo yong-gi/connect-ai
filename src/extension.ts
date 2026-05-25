@@ -2086,6 +2086,57 @@ async function handleTelegramCommand(text: string): Promise<void> {
         await sendTelegramReport(`${cmd === '/done' ? '✅' : '✖️'} \`${match.id.slice(-9)}\` ${match.title}\n→ ${newStatus === 'done' ? '완료' : '취소'} 처리됨.`);
         return;
     }
+    if (cmd === '/cancel-plan') {
+        const planArg = rest.trim();
+        if (!planArg) {
+            await sendTelegramReport('사용법: `/cancel-plan <planId>`\n예: `/cancel-plan delegate-20260525045548-6ltd`');
+            return;
+        }
+        const planId = _cancelPlanFindPlanIdArg(planArg);
+        if (!planId) {
+            await sendTelegramReport(`plan을 찾지 못했어요: \`${planArg}\`\n/plan 으로 최근 플랜을 확인해 주세요.`);
+            return;
+        }
+
+        const tasks = readTracker().tasks.filter(t => (t.planId || '').trim() === planId);
+        if (tasks.length === 0) {
+            await sendTelegramReport(`plan을 찾지 못했어요: \`${planArg}\`\n/plan 으로 최근 플랜을 확인해 주세요.`);
+            return;
+        }
+
+        let cancelled = 0;
+        let keptDone = 0;
+        let alreadyCancelled = 0;
+        for (const task of tasks) {
+            if (task.status === 'done') {
+                keptDone += 1;
+                continue;
+            }
+            if (task.status === 'cancelled') {
+                alreadyCancelled += 1;
+                continue;
+            }
+            if (task.status !== 'pending' && task.status !== 'in_progress' && task.status !== 'failed') {
+                continue;
+            }
+            const nextEvidence = _appendTrackerEvidence(task.evidence, 'plan 단위 취소');
+            updateTrackerTask(task.id, {
+                status: 'cancelled',
+                completedAt: new Date().toISOString(),
+                evidence: nextEvidence,
+            });
+            cancelled += 1;
+        }
+
+        await sendTelegramReport([
+            `✅ plan 취소 완료`,
+            `- planId: \`${planId}\``,
+            `- 취소: ${cancelled}개`,
+            `- 유지(done): ${keptDone}개`,
+            `- 이미 취소됨: ${alreadyCancelled}개`,
+        ].join('\n'));
+        return;
+    }
     /* P1-8: edit commands — let the user retarget tasks without re-creating.
        Loose date parser (ISO, "내일", "오늘 15:00", "+2h") covers the
        common cases without dragging in a date library. */
@@ -4978,6 +5029,24 @@ function _delegateFindPlanIdArg(arg: string): string | null {
   if (!needle) return null;
   const plans = Array.from(new Set(readTracker().tasks.map(t => (t.planId || '').trim()).filter(Boolean)));
   return plans.find(p => p === needle) || plans.find(p => p.endsWith(needle)) || null;
+}
+
+function _cancelPlanFindPlanIdArg(arg: string): string | null {
+  const needle = (arg || '').trim();
+  if (!needle) return null;
+  const plans = Array.from(new Set(readTracker().tasks.map(t => (t.planId || '').trim()).filter(Boolean)));
+  return plans.find(p => p === needle)
+    || plans.find(p => p.endsWith(needle))
+    || plans.find(p => p.includes(needle))
+    || null;
+}
+
+function _appendTrackerEvidence(existing: string | undefined, extra: string): string {
+  const current = (existing || '').trim();
+  const addition = (extra || '').trim();
+  if (!current) return addition;
+  if (!addition) return current;
+  return `${current}\n${addition}`;
 }
 
 function _delegateSelectPlanId(): string | null {
