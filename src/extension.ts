@@ -2202,22 +2202,90 @@ async function handleTelegramCommand(text: string): Promise<void> {
                 return;
             }
         }
-        updateTrackerTask(match.id, { status: 'in_progress' });
         await sendTelegramReport(`🛡️ \`${match.id.slice(-9)}\` ${match.title}\n→ 안전 실행을 시작했어요.`);
         try {
-            const result = await _runSafeExecuteTask(match);
+            const result = await _runSafeTaskSequential(match);
             await sendTelegramLong(result.message);
         } catch (e: any) {
             const errMsg = e?.message || String(e);
-            const evidence = /timeout/i.test(errMsg)
-                ? `run-safe timeout: ${match.id}\n${errMsg}`
-                : `run-safe 오류: ${match.id}\n${errMsg}`;
-            updateTrackerTask(match.id, {
-                status: 'failed',
-                evidence,
-            });
             await sendTelegramReport(`run-safe 실행 중 오류가 발생했어요: ${errMsg}`);
         }
+        return;
+    }
+    if (cmd === '/run-ready') {
+        const argPlan = rest.trim();
+        const planId = _runReadyResolvePlanId(argPlan);
+        if (!planId) {
+            await sendTelegramReport(argPlan
+                ? `플랜을 찾지 못했어요: \`${argPlan}\``
+                : '실행 가능한 플랜이 없어요.');
+            return;
+        }
+
+        const initial = _runReadyCollectReadyTasks(planId);
+        const planTasks = readTracker().tasks.filter(t => (t.planId || '').trim() === planId);
+        if (initial.tasks.length === 0) {
+            const pendingCount = planTasks.filter(t => t.status === 'pending').length;
+            const blockedNote = pendingCount > 0
+                ? '현재 ready 상태인 작업이 없어요.'
+                : 'pending 작업이 없어요.';
+            const nextStage = planTasks
+                .filter(t => t.status === 'pending')
+                .map(t => _delegatePlanStageSortValue(t.stage))
+                .filter(n => isFinite(n))
+                .sort((a, b) => a - b)[0];
+            const nextTitle = nextStage === undefined
+                ? ''
+                : `\n- 다음 stage: ${nextStage === Number.MAX_SAFE_INTEGER ? '미지정' : nextStage}`;
+            await sendTelegramReport(`실행 가능한 작업이 없어요.\n- planId: \`${planId}\`${nextTitle}\n- ${blockedNote}`);
+            return;
+        }
+
+        const preview = initial.tasks.map(t => {
+            const a = (t.agentIds && t.agentIds[0]) ? AGENTS[t.agentIds[0]] : null;
+            const owner = a ? a.name : (t.agentIds && t.agentIds[0]) || 'Unknown';
+            return `- ${owner} \`${t.id.slice(-9)}\` ${t.title}`;
+        }).join('\n');
+        const warningText = initial.warnings.length > 0
+            ? `\n\n_경고: ${initial.warnings.slice(0, 2).join(' / ')}${initial.warnings.length > 2 ? ' ...' : ''}_`
+            : '';
+        await sendTelegramReport(`실행 가능한 작업 ${initial.tasks.length}개를 찾았어요.\n${preview}${warningText}`);
+
+        let completed = 0;
+        let failed = 0;
+        let halted = false;
+        for (const task of initial.tasks) {
+            try {
+                await _runSafeTaskSequential(task);
+                completed += 1;
+            } catch (e: any) {
+                failed += 1;
+                halted = true;
+                const errMsg = e?.message || String(e);
+                await sendTelegramReport(`run-ready 중단: \`${task.id.slice(-9)}\` ${errMsg}`);
+                break;
+            }
+        }
+
+        const refreshed = _runReadyCollectReadyTasks(planId);
+        const nextReadyText = refreshed.tasks.length > 0
+            ? refreshed.tasks.map(t => {
+                const a = (t.agentIds && t.agentIds[0]) ? AGENTS[t.agentIds[0]] : null;
+                const owner = a ? a.name : (t.agentIds && t.agentIds[0]) || 'Unknown';
+                return `${owner} ${t.id.slice(-9)} ${t.title}`;
+            }).join(' / ')
+            : '없음';
+        const summaryLines = [
+            `✅ run-ready 완료`,
+            `- 완료: ${completed}개`,
+            `- 실패: ${failed}개`,
+            `- 다음 실행 가능: ${nextReadyText}`,
+            `다음 확인: /plan, /queue, /progress <id>`,
+        ];
+        if (halted) {
+            summaryLines.splice(1, 0, `- 중단: 실패 발생으로 이후 작업 실행 안 함`);
+        }
+        await sendTelegramLong(summaryLines.join('\n'));
         return;
     }
     if (cmd === '/research') {
@@ -4912,6 +4980,12 @@ function _runSafeDepsSummary(task: TrackerTask): string {
   }).join('\n');
 }
 
+function _runSafeFailureEvidence(task: TrackerTask, errMsg: string): string {
+  return /timeout/i.test(errMsg)
+    ? `run-safe timeout: ${task.id}\n${errMsg}`
+    : `run-safe 오류: ${task.id}\n${errMsg}`;
+}
+
 function _runSafeBuildSystemPrompt(agentId: string, task: TrackerTask): string {
   const roleRules: Record<string, string> = {
     researcher: '핵심 가설 3개 / 타깃 니즈 3개 / 강의 주제 후보 3개 / 다음 확인 필요 2개',
@@ -4998,6 +5072,67 @@ async function _runSafeExecuteTask(task: TrackerTask): Promise<{ ok: boolean; me
     ].join('\n'),
   });
   return { ok: true, message: `✅ run-safe 완료\n- 작업: \`${task.id.slice(-9)}\` ${task.title}\n- 결과 요약: ${summary}\n- 결과 파일: \`${relativePath}\`` };
+}
+
+function _runReadyResolvePlanId(arg: string): string | null {
+  const needle = (arg || '').trim();
+  if (needle) return _delegateFindPlanIdArg(needle);
+  const candidates = readTracker().tasks
+    .filter(t => (t.planId || '').trim() && t.status === 'pending')
+    .slice()
+    .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+  return candidates[0]?.planId?.trim() || null;
+}
+
+function _runReadyCollectReadyTasks(planId: string): { tasks: TrackerTask[]; warnings: string[]; title: string } {
+  const all = readTracker().tasks.filter(t => (t.planId || '').trim() === planId);
+  const warnings: string[] = [];
+  const pending = all.filter(t => t.status === 'pending');
+  const ready = pending.filter(t => {
+    const deps = Array.isArray(t.dependsOn) ? t.dependsOn.filter(Boolean) : [];
+    for (const depId of deps) {
+      const dep = findTrackerTaskByIdArg(depId);
+      if (!dep) {
+        warnings.push(`의존 작업을 찾지 못했어요: \`${depId}\` (${t.id.slice(-9)})`);
+        return false;
+      }
+      if (dep.status === 'cancelled' || dep.status === 'failed') {
+        warnings.push(`선행 작업이 취소 또는 실패 상태예요: \`${dep.id}\` → ${t.id.slice(-9)}`);
+        return false;
+      }
+      if (dep.status !== 'done') return false;
+    }
+    return true;
+  });
+  const title = (() => {
+    const first = all[0];
+    if (!first) return '실행 플랜';
+    const desc = first.description || '';
+    const m = desc.match(/^\[delegate goal\]\s*(.+)$/m);
+    return (m && m[1].trim()) ? m[1].trim() : first.title;
+  })();
+  if (ready.length === 0) return { tasks: [], warnings, title };
+  const minStage = Math.min(...ready.map(t => _delegatePlanStageSortValue(t.stage)));
+  const selected = ready
+    .filter(t => _delegatePlanStageSortValue(t.stage) === minStage)
+    .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime())
+    .slice(0, 3);
+  return { tasks: selected, warnings, title };
+}
+
+async function _runSafeTaskSequential(task: TrackerTask): Promise<{ ok: boolean; message: string }> {
+  const inProgress = updateTrackerTask(task.id, { status: 'in_progress' });
+  if (!inProgress) throw new Error(`tracker task not found: ${task.id}`);
+  try {
+    return await _runSafeExecuteTask(task);
+  } catch (e: any) {
+    const errMsg = e?.message || String(e);
+    updateTrackerTask(task.id, {
+      status: 'failed',
+      evidence: _runSafeFailureEvidence(task, errMsg),
+    });
+    throw e;
+  }
 }
 
 /* P1-8: Forgiving date parser for /reschedule. Covers the four shapes the
