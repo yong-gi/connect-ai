@@ -2616,6 +2616,100 @@ async function handleTelegramCommand(text: string): Promise<void> {
         }
         return;
     }
+    if (cmd === '/auto-safe-status') {
+        const snap = _autoSafeStatusSnapshot();
+        const autoCycleEnabled = vscode.workspace.getConfiguration('connectAiLab').get<boolean>('autoCycleEnabled', true);
+        const lines = [
+            `🛡️ *Safe Auto 상태*`,
+            `- Safe Auto: OFF`,
+            `- active planId: ${snap.activePlanId ? `\`${snap.activePlanId}\`` : '없음'}`,
+            `- running: ${snap.running ? 'true' : 'false'}`,
+            `- 기존 Auto Cycle 설정: ${autoCycleEnabled ? 'ON' : 'OFF'}`,
+            `- 다음 사용 가능 명령: /auto-safe-run-once <planId>`,
+        ];
+        if (snap.lastTickAt > 0) {
+            lines.push(`- last tick: ${new Date(snap.lastTickAt).toLocaleString('ko-KR')}`);
+        }
+        if (snap.lastError) {
+            lines.push(`- last error: ${snap.lastError.slice(0, 120)}`);
+        }
+        await sendTelegramLong(lines.join('\n'));
+        return;
+    }
+    if (cmd === '/auto-safe-run-once') {
+        const argPlan = rest.trim();
+        const resolved = _autoSafeResolvePlanId(argPlan);
+        if (!resolved.planId) {
+            if (resolved.reason === 'multiple') {
+                await sendTelegramReport([
+                    `실행 가능한 플랜이 여러 개 있어요.`,
+                    `/plan 으로 확인 후 /auto-safe-run-once <planId>로 실행해 주세요.`,
+                ].join('\n'));
+            } else if (resolved.reason === 'ambiguous') {
+                await sendTelegramReport(`플랜이 여러 개 매칭돼요: \`${argPlan}\`\n/plan 으로 확인 후 다시 입력해 주세요.`);
+            } else if (resolved.reason === 'not_found') {
+                await sendTelegramReport(`플랜을 찾지 못했어요: \`${argPlan}\`\n/plan 으로 확인 후 다시 입력해 주세요.`);
+            } else {
+                await sendTelegramReport('실행 가능한 플랜이 없어요.');
+            }
+            return;
+        }
+        const planId = resolved.planId;
+        if (_autoSafeRunning) {
+            await sendTelegramReport(`⚠️ 이미 auto-safe 실행 중입니다.\n- planId: \`${_autoSafeActivePlanId || planId}\``);
+            return;
+        }
+        if (_runningRunPlanLocks.has(_RUN_PLAN_GLOBAL_LOCK) || _runningRunPlanLocks.has(planId)) {
+            await sendTelegramReport(`⚠️ run-plan이 실행 중이라 auto-safe를 시작할 수 없어요.\n- planId: \`${planId}\``);
+            return;
+        }
+        const tasks = readTracker().tasks.filter(t => (t.planId || '').trim() === planId);
+        if (tasks.length === 0) {
+            await sendTelegramReport(`플랜을 찾지 못했어요: \`${argPlan || planId}\`\n/plan 으로 확인 후 다시 입력해 주세요.`);
+            return;
+        }
+        if (_runPlanIsAllDone(planId)) {
+            await sendTelegramReport(`이미 완료된 플랜입니다.\n- planId: \`${planId}\``);
+            return;
+        }
+
+        _autoSafeRunning = true;
+        _autoSafeActivePlanId = planId;
+        _autoSafeLastError = '';
+        try {
+            await sendTelegramReport([
+                `auto-safe run-once 시작`,
+                `- planId: \`${planId}\``,
+                `- 최대 실행 작업: 2개`,
+            ].join('\n'));
+
+            const result = await _autoSafeRunOnceTick(planId, 2);
+            if (!result) return;
+
+            _autoSafeLastTickAt = Date.now();
+            const summaryLines = [
+                `✅ auto-safe run-once 완료`,
+                `- 완료: ${result.completed}개`,
+                `- 실패: ${result.failed}개`,
+                `- 다음 실행 가능: ${result.nextReadyText}`,
+                `다음 확인: /plan, /queue, /result <id>`,
+            ];
+            if (result.blocked) {
+                summaryLines.splice(1, 0, `- 상태: blocked (ready 작업이 없어요)`);
+            } else if (result.maxTasksHit) {
+                summaryLines.splice(1, 0, `- 상태: maxTasks 도달`);
+            }
+            await sendTelegramLong(summaryLines.join('\n'));
+        } catch (e: any) {
+            const errMsg = _formatAxiosLikeError(e);
+            _autoSafeLastError = errMsg;
+            await sendTelegramReport(`auto-safe run-once 중단: ${errMsg}`);
+        } finally {
+            _autoSafeRunning = false;
+            _autoSafeActivePlanId = '';
+        }
+        return;
+    }
     if (cmd === '/research') {
         const researchQuery = rest.trim();
         if (!researchQuery) {
@@ -5173,6 +5267,10 @@ let _lastRunPlanStartedAt = 0;
 let _lastRunPlanStartedPlanId = '';
 let _lastRunPlanFinishedAt = 0;
 let _lastRunPlanFinishedPlanId = '';
+let _autoSafeRunning = false;
+let _autoSafeActivePlanId = '';
+let _autoSafeLastTickAt = 0;
+let _autoSafeLastError = '';
 
 function _delegateSelectPlanId(): string | null {
   const all = readTracker().tasks.filter(t => (t.planId || '').trim());
@@ -5572,6 +5670,89 @@ function _runPlanMatchPlanIdArg(arg: string): { planId: string | null; ambiguous
 function _runPlanIsAllDone(planId: string): boolean {
   const tasks = readTracker().tasks.filter(t => (t.planId || '').trim() === planId);
   return tasks.length > 0 && tasks.every(t => t.status === 'done');
+}
+
+function _autoSafeStatusSnapshot(): { running: boolean; activePlanId: string; lastTickAt: number; lastError: string } {
+  return {
+    running: _autoSafeRunning,
+    activePlanId: _autoSafeActivePlanId,
+    lastTickAt: _autoSafeLastTickAt,
+    lastError: _autoSafeLastError,
+  };
+}
+
+function _autoSafeResolvePlanId(argPlan: string): { planId: string | null; reason?: string } {
+  const needle = (argPlan || '').trim();
+  if (needle) {
+    const found = _runPlanMatchPlanIdArg(needle);
+    if (found.planId) return { planId: found.planId };
+    return { planId: null, reason: found.ambiguous ? 'ambiguous' : 'not_found' };
+  }
+  const pendingPlans = _runPlanListPendingPlanIds();
+  if (pendingPlans.length === 1) return { planId: pendingPlans[0] };
+  if (pendingPlans.length > 1) return { planId: null, reason: 'multiple' };
+  return { planId: null, reason: 'none' };
+}
+
+async function _autoSafeRunOnceTick(planId: string, maxTasks = 2): Promise<{ completed: number; failed: number; blocked: boolean; remainingPending: number; nextReadyText: string; maxTasksHit: boolean } | null> {
+  const initialTasks = readTracker().tasks.filter(t => (t.planId || '').trim() === planId);
+  if (initialTasks.length === 0) return { completed: 0, failed: 0, blocked: false, remainingPending: 0, nextReadyText: '없음', maxTasksHit: false };
+  if (_runPlanIsAllDone(planId)) return { completed: 0, failed: 0, blocked: false, remainingPending: 0, nextReadyText: '없음', maxTasksHit: false };
+
+  let completed = 0;
+  let failed = 0;
+  let blocked = false;
+  let maxTasksHit = false;
+  const ready = _runReadyCollectReadyTasks(planId);
+  if (ready.tasks.length === 0) {
+    const pendingCount = initialTasks.filter(t => t.status === 'pending').length;
+    if (pendingCount > 0) blocked = true;
+    const refreshed = _runReadyCollectReadyTasks(planId);
+    const nextReadyText = refreshed.tasks.length > 0
+      ? refreshed.tasks.map(t => {
+          const a = (t.agentIds && t.agentIds[0]) ? AGENTS[t.agentIds[0]] : null;
+          const owner = a ? a.name : (t.agentIds && t.agentIds[0]) || 'Unknown';
+          return `${owner} ${t.id.slice(-9)} ${t.title}`;
+        }).join(' / ')
+      : '없음';
+    const remainingPending = readTracker().tasks.filter(t => (t.planId || '').trim() === planId && t.status === 'pending').length;
+    return { completed, failed, blocked, remainingPending, nextReadyText, maxTasksHit };
+  }
+
+    for (const task of ready.tasks.slice(0, maxTasks)) {
+    try {
+      await _runSafeTaskSequential(task);
+      completed += 1;
+    } catch (e: any) {
+      failed += 1;
+      const latest = findTrackerTaskByIdArg(task.id) || task;
+      const errMsg = _formatAxiosLikeError(e);
+      _autoSafeLastError = errMsg;
+      _autoSafeLastTickAt = Date.now();
+      const evidence = (latest.evidence || '').trim();
+      const failLines = [
+        `auto-safe run-once 중단`,
+        `- 실패 작업: ${task.id.slice(-9)} ${task.title}`,
+        `- 오류: ${errMsg}`,
+        evidence ? `- evidence: ${evidence}` : '- evidence: (없음)',
+        `다음 확인: /result ${task.id.slice(-9)} 또는 /progress ${task.id.slice(-9)}`,
+      ];
+      await sendTelegramLong(failLines.join('\n'));
+      return null;
+    }
+  }
+
+  if (ready.tasks.length > maxTasks) maxTasksHit = true;
+  const refreshed = _runReadyCollectReadyTasks(planId);
+  const nextReadyText = refreshed.tasks.length > 0
+    ? refreshed.tasks.map(t => {
+        const a = (t.agentIds && t.agentIds[0]) ? AGENTS[t.agentIds[0]] : null;
+        const owner = a ? a.name : (t.agentIds && t.agentIds[0]) || 'Unknown';
+        return `${owner} ${t.id.slice(-9)} ${t.title}`;
+      }).join(' / ')
+    : '없음';
+  const remainingPending = readTracker().tasks.filter(t => (t.planId || '').trim() === planId && t.status === 'pending').length;
+  return { completed, failed, blocked, remainingPending, nextReadyText, maxTasksHit };
 }
 
 function _runReadyCollectReadyTasks(planId: string): { tasks: TrackerTask[]; warnings: string[]; title: string } {
