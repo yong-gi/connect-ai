@@ -2446,19 +2446,80 @@ async function handleTelegramCommand(text: string): Promise<void> {
         return;
     }
     if (cmd === '/run-plan') {
-        try {
-            const argPlan = rest.trim();
-            const planId = _runPlanResolvePlanId(argPlan);
+        const argPlan = rest.trim();
+        const explicit = argPlan.length > 0;
+        const cooldownMs = 30_000;
+        const now = Date.now();
+
+        if (!explicit && _lastRunPlanFinishedAt > 0 && (now - _lastRunPlanFinishedAt) < cooldownMs) {
+            await sendTelegramReport([
+                `⚠️ 방금 run-plan이 완료되었습니다.`,
+                `중복 입력으로 판단하여 새 플랜은 실행하지 않았어요.`,
+                `다른 플랜을 실행하려면 /run-plan <planId>로 명시해 주세요.`,
+            ].join('\n'));
+            return;
+        }
+
+        let planId: string | null = null;
+        let planLookupAmbiguous = false;
+
+        if (explicit) {
+            const found = _runPlanMatchPlanIdArg(argPlan);
+            planId = found.planId;
+            planLookupAmbiguous = found.ambiguous;
             if (!planId) {
-                await sendTelegramReport(argPlan
-                    ? `플랜을 찾지 못했어요: \`${argPlan}\``
-                    : '실행 가능한 플랜이 없어요.');
+                await sendTelegramReport(planLookupAmbiguous
+                    ? `플랜이 여러 개 매칭돼요: \`${argPlan}\`\n/plan 으로 확인 후 다시 입력해 주세요.`
+                    : `플랜을 찾지 못했어요: \`${argPlan}\`\n/plan 으로 확인 후 다시 입력해 주세요.`);
                 return;
             }
+        } else {
+            const pendingPlans = _runPlanListPendingPlanIds();
+            if (pendingPlans.length === 0) {
+                await sendTelegramReport('실행 가능한 플랜이 없어요.');
+                return;
+            }
+            if (pendingPlans.length > 1) {
+                await sendTelegramReport([
+                    `실행 가능한 플랜이 여러 개 있어요.`,
+                    `/plan 으로 확인 후 /run-plan <planId>로 실행해 주세요.`,
+                ].join('\n'));
+                return;
+            }
+            planId = pendingPlans[0];
+        }
 
+        if (!planId) {
+            await sendTelegramReport('실행 가능한 플랜이 없어요.');
+            return;
+        }
+
+        const initialTasks = readTracker().tasks.filter(t => (t.planId || '').trim() === planId);
+        if (initialTasks.length === 0) {
+            await sendTelegramReport(`플랜을 찾지 못했어요: \`${argPlan || planId}\`\n/plan 으로 확인 후 다시 입력해 주세요.`);
+            return;
+        }
+        if (_runPlanIsAllDone(planId)) {
+            await sendTelegramReport(`이미 완료된 플랜입니다.\n- planId: \`${planId}\``);
+            return;
+        }
+
+        if (_runningRunPlanLocks.has(_RUN_PLAN_GLOBAL_LOCK) || _runningRunPlanLocks.has(planId)) {
+            await sendTelegramReport([
+                `⚠️ 이미 run-plan 실행 중입니다.`,
+                `- planId: \`${planId}\``,
+                `완료 후 다시 시도해주세요.`,
+            ].join('\n'));
+            return;
+        }
+
+        _runningRunPlanLocks.add(_RUN_PLAN_GLOBAL_LOCK);
+        _runningRunPlanLocks.add(planId);
+        _lastRunPlanStartedAt = now;
+        _lastRunPlanStartedPlanId = planId;
+        try {
             const maxRounds = 10;
             const maxTasks = 10;
-            const initialTasks = readTracker().tasks.filter(t => (t.planId || '').trim() === planId);
             const initialPending = initialTasks.filter(t => t.status === 'pending');
 
             await sendTelegramReport([
@@ -2537,18 +2598,23 @@ async function handleTelegramCommand(text: string): Promise<void> {
                 summaryLines.splice(1, 0, `- 상태: blocked (ready 작업이 없어요)`);
             } else if (maxTasksHit) {
                 summaryLines.splice(1, 0, `- 상태: maxTasks 도달`);
-                summaryLines.push(`- 다음 실행: /run-plan`);
+                summaryLines.push(`- 다음 실행: /run-plan <planId>`);
             } else if (maxRoundsHit) {
                 summaryLines.splice(1, 0, `- 상태: maxRounds 도달`);
-                summaryLines.push(`- 다음 실행: /run-plan`);
+                summaryLines.push(`- 다음 실행: /run-plan <planId>`);
             }
             await sendTelegramReport(summaryLines.join('\n'));
             return;
         } catch (e: any) {
             const errMsg = _formatAxiosLikeError(e);
             await sendTelegramReport(`run-plan 중단: ${errMsg}`);
-            return;
+        } finally {
+            _lastRunPlanFinishedAt = Date.now();
+            _lastRunPlanFinishedPlanId = planId;
+            _runningRunPlanLocks.delete(planId);
+            _runningRunPlanLocks.delete(_RUN_PLAN_GLOBAL_LOCK);
         }
+        return;
     }
     if (cmd === '/research') {
         const researchQuery = rest.trim();
@@ -5101,6 +5167,13 @@ function _appendTrackerEvidence(existing: string | undefined, extra: string): st
   return `${current}\n${addition}`;
 }
 
+const _runningRunPlanLocks = new Set<string>();
+const _RUN_PLAN_GLOBAL_LOCK = '__any__';
+let _lastRunPlanStartedAt = 0;
+let _lastRunPlanStartedPlanId = '';
+let _lastRunPlanFinishedAt = 0;
+let _lastRunPlanFinishedPlanId = '';
+
 function _delegateSelectPlanId(): string | null {
   const all = readTracker().tasks.filter(t => (t.planId || '').trim());
   if (all.length === 0) return null;
@@ -5467,6 +5540,38 @@ function _runPlanResolvePlanId(arg: string): string | null {
   const needle = (arg || '').trim();
   if (needle) return _delegateFindPlanIdArg(needle);
   return _runReadyResolvePlanId('');
+}
+
+function _runPlanListPlanIdsByStatus(status: TrackerTask['status']): string[] {
+  return Array.from(new Set(
+    readTracker().tasks
+      .filter(t => t.status === status && (t.planId || '').trim())
+      .map(t => (t.planId || '').trim())
+      .filter(Boolean)
+  ));
+}
+
+function _runPlanListPendingPlanIds(): string[] {
+  return Array.from(new Set(
+    readTracker().tasks
+      .filter(t => t.status === 'pending' && (t.planId || '').trim())
+      .map(t => (t.planId || '').trim())
+      .filter(Boolean)
+  ));
+}
+
+function _runPlanMatchPlanIdArg(arg: string): { planId: string | null; ambiguous: boolean } {
+  const needle = (arg || '').trim();
+  if (!needle) return { planId: null, ambiguous: false };
+  const plans = Array.from(new Set(readTracker().tasks.map(t => (t.planId || '').trim()).filter(Boolean)));
+  const matches = plans.filter(p => p === needle || p.endsWith(needle) || p.includes(needle));
+  if (matches.length === 1) return { planId: matches[0], ambiguous: false };
+  return { planId: null, ambiguous: matches.length > 1 };
+}
+
+function _runPlanIsAllDone(planId: string): boolean {
+  const tasks = readTracker().tasks.filter(t => (t.planId || '').trim() === planId);
+  return tasks.length > 0 && tasks.every(t => t.status === 'done');
 }
 
 function _runReadyCollectReadyTasks(planId: string): { tasks: TrackerTask[]; warnings: string[]; title: string } {
