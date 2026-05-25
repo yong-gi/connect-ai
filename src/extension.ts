@@ -2342,6 +2342,111 @@ async function handleTelegramCommand(text: string): Promise<void> {
         await sendTelegramLong(summaryLines.join('\n'));
         return;
     }
+    if (cmd === '/run-plan') {
+        try {
+            const argPlan = rest.trim();
+            const planId = _runPlanResolvePlanId(argPlan);
+            if (!planId) {
+                await sendTelegramReport(argPlan
+                    ? `플랜을 찾지 못했어요: \`${argPlan}\``
+                    : '실행 가능한 플랜이 없어요.');
+                return;
+            }
+
+            const maxRounds = 10;
+            const maxTasks = 10;
+            const initialTasks = readTracker().tasks.filter(t => (t.planId || '').trim() === planId);
+            const initialPending = initialTasks.filter(t => t.status === 'pending');
+
+            await sendTelegramReport([
+                `run-plan 시작`,
+                `- planId: \`${planId}\``,
+                `- 최대 실행 작업: ${maxTasks}개`,
+                `- 최대 반복 stage: ${maxRounds}회`,
+            ].join('\n'));
+
+            let completed = 0;
+            let failed = 0;
+            let rounds = 0;
+            let executed = 0;
+            let blocked = false;
+            let maxTasksHit = false;
+            let maxRoundsHit = false;
+
+            while (rounds < maxRounds && executed < maxTasks) {
+                const currentTasks = readTracker().tasks.filter(t => (t.planId || '').trim() === planId);
+                const pendingCount = currentTasks.filter(t => t.status === 'pending').length;
+                if (pendingCount === 0) break;
+
+                const ready = _runReadyCollectReadyTasks(planId);
+                if (ready.tasks.length === 0) {
+                    blocked = true;
+                    break;
+                }
+
+                rounds += 1;
+                for (const task of ready.tasks) {
+                    if (executed >= maxTasks) {
+                        maxTasksHit = true;
+                        break;
+                    }
+                    try {
+                        await _runSafeTaskSequential(task);
+                        completed += 1;
+                        executed += 1;
+                    } catch (e: any) {
+                        failed += 1;
+                        const latest = findTrackerTaskByIdArg(task.id) || task;
+                        const errMsg = _formatAxiosLikeError(e);
+                        const evidence = (latest.evidence || '').trim();
+                        const failLines = [
+                            `run-plan 중단`,
+                            `- 실패 작업: ${task.id.slice(-9)} ${task.title}`,
+                            `- 오류: ${errMsg}`,
+                            evidence ? `- evidence: ${evidence}` : '- evidence: (없음)',
+                            `다음 확인: /result ${task.id.slice(-9)} 또는 /progress ${task.id.slice(-9)}`,
+                        ];
+                        await sendTelegramLong(failLines.join('\n'));
+                        return;
+                    }
+                }
+
+                if (executed >= maxTasks) {
+                    maxTasksHit = readTracker().tasks.filter(t => (t.planId || '').trim() === planId && t.status === 'pending').length > 0;
+                    break;
+                }
+            }
+
+            const refreshedTasks = readTracker().tasks.filter(t => (t.planId || '').trim() === planId);
+            const remainingPending = refreshedTasks.filter(t => t.status === 'pending').length;
+            if (!blocked && remainingPending > 0 && rounds >= maxRounds) {
+                maxRoundsHit = true;
+            }
+
+            const summaryLines = [
+                `✅ run-plan 완료`,
+                `- 완료: ${completed}개`,
+                `- 실패: ${failed}개`,
+                `- 남은 pending: ${remainingPending}개`,
+                `다음 확인: /plan, /queue, /result <id>`,
+            ];
+            if (blocked) {
+                summaryLines.splice(1, 0, `- 상태: blocked (ready 작업이 없어요)`);
+            } else if (maxTasksHit) {
+                summaryLines.splice(1, 0, `- 상태: maxTasks 도달`);
+                summaryLines.push(`- 다음 실행: /run-plan`);
+            } else if (maxRoundsHit) {
+                summaryLines.splice(1, 0, `- 상태: maxRounds 도달`);
+                summaryLines.push(`- 다음 실행: /run-plan`);
+            }
+            await sendTelegramReport(summaryLines.join('\n'));
+            return;
+        } catch (e: any) {
+            const errMsg = _formatAxiosLikeError(e);
+            await sendTelegramReport(`run-plan 중단: ${errMsg}`);
+            return;
+        }
+    }
     if (cmd === '/research') {
         const researchQuery = rest.trim();
         if (!researchQuery) {
@@ -2739,6 +2844,14 @@ function _buildDispatchStatusReport(): string {
 }
 
 async function handleTelegramViaSecretary(userText: string): Promise<void> {
+    /* Slash command safety-net.
+       일부 Telegram 진입 경로에서 `/run-plan ...` 이 일반 대화로
+       흘러가는 경우가 있어, Secretary LLM 전에 명령 라우터로
+       바로 되돌린다. */
+    if (/^\/run-plan(?:\s|$)/i.test(userText)) {
+        await handleTelegramCommand(userText);
+        return;
+    }
     /* Mirror user's Telegram message into the sidebar chat */
     try { _activeChatProvider?.postSystemNote?.(`텔레그램: "${userText.slice(0, 200)}"`, '📱'); } catch { /* ignore */ }
     /* Show the bot is working — Telegram typing indicator */
@@ -5114,6 +5227,23 @@ function _runSafeFailureEvidence(task: TrackerTask, errMsg: string): string {
     : `run-safe 오류: ${task.id}\n${errMsg}`;
 }
 
+function _formatAxiosLikeError(err: any): string {
+  const status = err?.response?.status;
+  const code = err?.code;
+  const message = err?.message || String(err || 'unknown error');
+  const data = err?.response?.data;
+  const details: string[] = [];
+  if (status) details.push(`HTTP ${status}`);
+  if (code && code !== 'ERR_BAD_REQUEST') details.push(`code=${code}`);
+  if (data && typeof data === 'object') {
+    const nested = data?.error?.message || data?.message || data?.error;
+    if (nested) details.push(String(nested).slice(0, 200));
+  } else if (typeof data === 'string' && data.trim()) {
+    details.push(data.trim().slice(0, 200));
+  }
+  return details.length > 0 ? `${details.join(' / ')} / ${message}` : message;
+}
+
 function _runSafeBuildSystemPrompt(agentId: string, task: TrackerTask): string {
   const roleRules: Record<string, string> = {
     researcher: '핵심 가설 3개 / 타깃 니즈 3개 / 강의 주제 후보 3개 / 다음 확인 필요 2개',
@@ -5210,6 +5340,12 @@ function _runReadyResolvePlanId(arg: string): string | null {
     .slice()
     .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
   return candidates[0]?.planId?.trim() || null;
+}
+
+function _runPlanResolvePlanId(arg: string): string | null {
+  const needle = (arg || '').trim();
+  if (needle) return _delegateFindPlanIdArg(needle);
+  return _runReadyResolvePlanId('');
 }
 
 function _runReadyCollectReadyTasks(planId: string): { tasks: TrackerTask[]; warnings: string[]; title: string } {
