@@ -2137,6 +2137,58 @@ async function handleTelegramCommand(text: string): Promise<void> {
         ].join('\n'));
         return;
     }
+    if (cmd === '/retry') {
+        const idArg = rest.trim();
+        if (!idArg) {
+            await sendTelegramReport('사용법: `/retry <id>`\n예: `/retry 1650-ujal`');
+            return;
+        }
+        const match = findTrackerTaskByIdArg(idArg);
+        if (!match) {
+            await sendTelegramReport(`작업을 찾지 못했어요: \`${idArg}\`\n사용법: \`/retry <id>\``);
+            return;
+        }
+        if (match.status === 'pending') {
+            await sendTelegramReport(`이미 대기 중인 작업이에요: \`${match.id.slice(-9)}\` ${match.title}`);
+            return;
+        }
+        if (match.status === 'in_progress') {
+            await sendTelegramReport(`현재 실행 중이라 retry할 수 없어요: \`${match.id.slice(-9)}\` ${match.title}`);
+            return;
+        }
+        if (match.status === 'done') {
+            await sendTelegramReport(`이미 완료된 작업이라 retry할 수 없어요: \`${match.id.slice(-9)}\` ${match.title}`);
+            return;
+        }
+        if (match.status === 'cancelled') {
+            await sendTelegramReport(`취소된 작업은 retry 대상이 아니에요: \`${match.id.slice(-9)}\` ${match.title}\n새로 진행하려면 /delegate를 사용해 주세요.`);
+            return;
+        }
+        if (match.status !== 'failed') {
+            await sendTelegramReport(`현재 status가 \`${match.status}\`라서 retry할 수 없어요.`);
+            return;
+        }
+
+        const nextEvidence = _appendTrackerEvidence(match.evidence, 'retry 준비됨');
+        updateTrackerTask(match.id, {
+            status: 'pending',
+            completedAt: undefined,
+            resultPath: undefined,
+            resultSummary: undefined,
+            evidence: nextEvidence,
+        });
+
+        await sendTelegramReport([
+            `✅ retry 준비 완료`,
+            `- 작업: \`${match.id.slice(-9)}\` ${match.title}`,
+            `- 상태: failed → pending`,
+            `다음 실행:`,
+            `- /run-safe ${match.id.slice(-9)}`,
+            `- /run-ready`,
+            `- /run-plan ${(match.planId || '').trim() || '<planId>'}`,
+        ].join('\n'));
+        return;
+    }
     /* P1-8: edit commands — let the user retarget tasks without re-creating.
        Loose date parser (ISO, "내일", "오늘 15:00", "+2h") covers the
        common cases without dragging in a date library. */
