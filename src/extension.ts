@@ -2476,10 +2476,40 @@ async function handleTelegramCommand(text: string): Promise<void> {
             await sendTelegramReport('사용법: `/cancel-plan <planId>`\n예: `/cancel-plan delegate-20260525045548-6ltd`');
             return;
         }
-        const planId = _cancelPlanFindPlanIdArg(planArg);
+        let planId = _cancelPlanFindPlanIdArg(planArg);
+        let cancelSource: 'plan' | 'task' | null = null;
+        let matchedTaskId = '';
         if (!planId) {
-            await sendTelegramReport(`plan을 찾지 못했어요: \`${planArg}\`\n/plan 으로 최근 플랜을 확인해 주세요.`);
-            return;
+            const taskMatches = findTrackerTasksByIdArg(planArg);
+            if (taskMatches.length > 1) {
+                const ids = taskMatches.slice(0, 5).map(t => `\`${t.id.slice(-9)}\``).join(', ');
+                await sendTelegramReport([
+                    `task id가 여러 개 매칭돼서 plan을 고를 수 없어요.`,
+                    `- 입력: \`${planArg}\``,
+                    `- 매칭 task: ${ids}${taskMatches.length > 5 ? ' ...' : ''}`,
+                    `정확한 task id나 planId로 다시 입력해 주세요.`,
+                ].join('\n'));
+                return;
+            }
+            const task = taskMatches[0] || null;
+            if (!task) {
+                await sendTelegramReport(`plan을 찾지 못했어요: \`${planArg}\`\n/plan 으로 최근 플랜을 확인해 주세요.`);
+                return;
+            }
+            matchedTaskId = task.id;
+            const taskPlanId = (task.planId || '').trim();
+            if (!taskPlanId) {
+                await sendTelegramReport([
+                    `이 작업에는 planId가 없어 plan 단위 취소를 할 수 없어요.`,
+                    `- taskId: \`${task.id.slice(-9)}\``,
+                    `/cancel \`${task.id.slice(-9)}\` 로 개별 취소해 주세요.`,
+                ].join('\n'));
+                return;
+            }
+            planId = taskPlanId;
+            cancelSource = 'task';
+        } else {
+            cancelSource = 'plan';
         }
 
         const tasks = readTracker().tasks.filter(t => (t.planId || '').trim() === planId);
@@ -2512,7 +2542,17 @@ async function handleTelegramCommand(text: string): Promise<void> {
             cancelled += 1;
         }
 
+        const headerLines = cancelSource === 'task'
+            ? [
+                `task id에서 planId를 찾아 plan을 취소합니다.`,
+                `- task id: \`${(matchedTaskId || planArg).slice(-9)}\``,
+                `- planId: \`${planId}\``,
+              ]
+            : [];
+
         await sendTelegramReport([
+            ...headerLines,
+            ...(headerLines.length > 0 ? [''] : []),
             `✅ plan 취소 완료`,
             `- planId: \`${planId}\``,
             `- 취소: ${cancelled}개`,
@@ -5878,8 +5918,17 @@ function listOpenTrackerTasks(): TrackerTask[] {
 function findTrackerTaskByIdArg(idArg: string): TrackerTask | null {
   const needle = idArg.trim();
   if (!needle) return null;
+  const matches = findTrackerTasksByIdArg(needle);
+  return matches[0] || null;
+}
+
+function findTrackerTasksByIdArg(idArg: string): TrackerTask[] {
+  const needle = idArg.trim();
+  if (!needle) return [];
   const all = readTracker().tasks;
-  return all.find(t => t.id === needle) || all.find(t => t.id.endsWith(needle)) || null;
+  const exact = all.filter(t => t.id === needle);
+  if (exact.length > 0) return exact;
+  return all.filter(t => t.id.endsWith(needle));
 }
 function formatTrackerTaskProgress(task: TrackerTask): string {
   const prio = _coercePriority(task.priority);
@@ -5894,6 +5943,7 @@ function formatTrackerTaskProgress(task: TrackerTask): string {
     `📋 *작업 진행상황*`,
     `- 제목: ${task.title}`,
     `- id: \`${task.id.slice(-9)}\``,
+    `- planId: ${task.planId || '(없음)'}`,
     `- status: ${task.status}`,
     `- owner: ${task.owner}`,
     `- agentIds: ${agentIds}`,
