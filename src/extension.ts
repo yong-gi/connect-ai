@@ -1963,7 +1963,6 @@ const TELEGRAM_HELP = `🤖 *Connect AI 사용법*
 1. \`/go\` 목표
 새 일을 맡깁니다.
 예: \`/go 5060 대상 AI 수익화 강의 사업을 준비해줘\`
-지금 바로 사용할 수 있습니다.
 
 2. \`/status\`
 지금 어디까지 진행됐는지 확인합니다.
@@ -1975,11 +1974,7 @@ const TELEGRAM_HELP = `🤖 *Connect AI 사용법*
 자동 진행을 멈춥니다.
 
 고급 명령 보기:
-\`/help advanced\`
-
-주의:
-현재 \`/go\`, \`/status\`는 바로 사용할 수 있습니다.
-\`/results\`, \`/stop\`은 다음 단계에서 추가 예정입니다.`;
+\`/help advanced\``;
 
 function _buildTelegramAdvancedHelp(): string {
   return [
@@ -2003,6 +1998,7 @@ function _buildTelegramAdvancedHelp(): string {
     '- `/run-plan`',
     '',
     '*결과 확인*',
+    '- `/results`',
     '- `/result`',
     '',
     '*정리/복구*',
@@ -2013,6 +2009,7 @@ function _buildTelegramAdvancedHelp(): string {
     '- `/auto-safe-status`',
     '- `/auto-safe-on`',
     '- `/auto-safe-run-once`',
+    '- `/stop`',
     '- `/auto-safe-off`',
     '',
     '*상태 확인*',
@@ -2021,7 +2018,7 @@ function _buildTelegramAdvancedHelp(): string {
     '- `/live`',
     '',
     '일반 사용자는 `/go` 중심으로 쓰면 됩니다.',
-    '향후 모바일용 상위 명령어: `/go`, `/status`, `/results`, `/stop`',
+    '모바일 기본 명령: `/go`, `/status`, `/results`, `/stop`',
   ].join('\n');
 }
 
@@ -2184,11 +2181,148 @@ function _statusBuildReport(): string {
     nextTasks,
     '',
     '다음 명령:',
-    '- /results : 결과 보기 예정',
+    '- /results : 결과 요약 보기',
     '- /result <id> : 특정 결과 보기',
-    '- /stop : 자동 진행 중단 예정',
+    '- /stop : 자동 진행 중단',
     '- /live : 상세 상태',
     '- /help advanced : 고급 명령',
+  ].join('\n');
+}
+
+function _resultsPickPlanId(argPlan: string): { planId: string | null; reason?: 'ambiguous' | 'not_found' | 'none' } {
+  const needle = (argPlan || '').trim();
+  if (needle) {
+    const found = _runPlanMatchPlanIdArg(needle);
+    if (found.planId) return { planId: found.planId };
+    return { planId: null, reason: found.ambiguous ? 'ambiguous' : 'not_found' };
+  }
+  const picked = _statusPickPlanId();
+  if (picked.planId) return { planId: picked.planId };
+  return { planId: null, reason: 'none' };
+}
+
+function _resultsTaskSummaryText(task: TrackerTask): string {
+  const summary = (task.resultSummary || '').trim();
+  if (summary) return _truncateResultText(summary, 260);
+
+  const evidence = (task.evidence || '').trim().replace(/\s+/g, ' ');
+  if (evidence) return _truncateResultText(evidence, 260);
+
+  const resultPathText = (task.resultPath || '').trim();
+  if (resultPathText) {
+    const fileResult = _trackerTaskResultFileContent(task);
+    if (fileResult.ok && fileResult.text !== undefined) {
+      const lines = fileResult.text.split(/\r?\n/).map(s => s.trim()).filter(Boolean).slice(0, 4);
+      const preview = lines.join(' ').trim();
+      if (preview) return _truncateResultText(preview, 260);
+      return '아직 결과 없음';
+    }
+  }
+
+  return '아직 결과 없음';
+}
+
+function _resultsTaskStatusLabel(task: TrackerTask): string {
+  if (task.status === 'done') return '완료';
+  if (task.status === 'in_progress') return '진행 중';
+  if (task.status === 'pending') return '대기';
+  if (task.status === 'failed') return '실패';
+  if (task.status === 'cancelled') return '취소됨';
+  return task.status;
+}
+
+function _resultsBuildReport(argPlan: string): string {
+  const picked = _resultsPickPlanId(argPlan);
+  if (!picked.planId) {
+    if (picked.reason === 'ambiguous') {
+      return `플랜이 여러 개 매칭돼요: \`${argPlan}\`\n/plan 으로 확인 후 \`/results <planId>\` 로 다시 입력해 주세요.`;
+    }
+    if (picked.reason === 'not_found') {
+      return `플랜을 찾지 못했어요: \`${argPlan}\`\n/plan 으로 확인 후 다시 입력해 주세요.`;
+    }
+    return [
+      '결과 요약',
+      '',
+      '확인할 결과가 없어요.',
+      '',
+      '다음 명령:',
+      '- /go : 새 작업 시작',
+      '- /help advanced : 고급 명령 보기',
+    ].join('\n');
+  }
+
+  const tasks = _statusCollectPlanTasks(picked.planId);
+  if (tasks.length === 0) {
+    return [
+      '결과 요약',
+      '',
+      '확인할 결과가 없어요.',
+      '',
+      '다음 명령:',
+      '- /go : 새 작업 시작',
+      '- /help advanced : 고급 명령 보기',
+    ].join('\n');
+  }
+
+  const goalText = _statusPlanGoalText(tasks);
+  const byId = new Map(tasks.map(t => [t.id, t]));
+  const totals = {
+    done: tasks.filter(t => t.status === 'done').length,
+    failed: tasks.filter(t => t.status === 'failed').length,
+    pending: tasks.filter(t => t.status === 'pending').length,
+    inProgress: tasks.filter(t => t.status === 'in_progress').length,
+    cancelled: tasks.filter(t => t.status === 'cancelled').length,
+  };
+  const taskLines: string[] = [];
+  const detailIds: string[] = [];
+
+  const ordered = tasks.slice().sort((a, b) => {
+    const sa = _delegatePlanStageSortValue(a.stage);
+    const sb = _delegatePlanStageSortValue(b.stage);
+    if (sa !== sb) return sa - sb;
+    return new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime();
+  });
+
+  for (let i = 0; i < ordered.length; i++) {
+    const task = ordered[i];
+    const a = (task.agentIds && task.agentIds[0]) ? AGENTS[task.agentIds[0]] : null;
+    const owner = a ? a.name : (task.agentIds && task.agentIds[0]) || 'Unknown';
+    const statusLabel = _resultsTaskStatusLabel(task);
+    const detail = _resultsTaskSummaryText(task);
+    const shortTitle = (task.title || '').trim().slice(0, 80);
+    taskLines.push([
+      `${i + 1}. ${a?.emoji || '•'} ${owner} \`${task.id.slice(-9)}\``,
+      `   ${shortTitle}`,
+      `   상태: ${statusLabel}`,
+      `   요약: ${detail}`,
+    ].join('\n'));
+    if (task.status === 'done' || task.status === 'failed') {
+      detailIds.push(`- /result ${task.id.slice(-9)}`);
+    }
+  }
+
+  const detailLines = detailIds.length > 0 ? detailIds.slice(0, 8).join('\n') : '- 없음';
+  return [
+    '결과 요약',
+    '',
+    `목표:`,
+    goalText,
+    '',
+    `planId:`,
+    picked.planId,
+    '',
+    '전체 작업:',
+    `- 완료: ${totals.done}개`,
+    `- 실패: ${totals.failed}개`,
+    `- 대기: ${totals.pending}개`,
+    `- 진행 중: ${totals.inProgress}개`,
+    `- 취소: ${totals.cancelled}개`,
+    '',
+    '결과:',
+    ...taskLines,
+    '',
+    '자세히 보기:',
+    detailLines,
   ].join('\n');
 }
 
@@ -2271,6 +2405,39 @@ async function handleTelegramCommand(text: string): Promise<void> {
     }
     if (cmd === '/status') {
         await sendTelegramLong(_statusBuildReport());
+        return;
+    }
+    if (cmd === '/results') {
+        const planArg = rest.trim();
+        await sendTelegramLong(_resultsBuildReport(planArg));
+        return;
+    }
+    if (cmd === '/stop') {
+        const wasEnabled = _autoSafeState.enabled;
+        const running = _autoSafeState.running;
+        _autoSafeDisable({ clearRunning: !running });
+        if (!wasEnabled) {
+            const lines: string[] = ['이미 자동 진행은 꺼져 있어요.'];
+            if (_autoSafeState.activePlanId) {
+                lines.push(`- active planId: \`${_autoSafeState.activePlanId}\``);
+            }
+            lines.push('지금 상태는 /status로 확인해 주세요.');
+            await sendTelegramLong(lines.join('\n'));
+            return;
+        }
+        await sendTelegramReport([
+            `⏸ 자동 진행을 멈췄어요.`,
+            '',
+            `- Safe Auto: OFF`,
+            `- active planId: ${_autoSafeState.activePlanId ? `\`${_autoSafeState.activePlanId}\`` : '없음'}`,
+            `- running: ${_autoSafeState.running ? 'true' : 'false'}`,
+            '',
+            `진행 중인 작업이 있다면 현재 작업은 끝난 뒤 멈춥니다.`,
+            `다시 진행하려면:`,
+            `- /go 목표`,
+            `- /auto-safe-on <planId>`,
+            `- /auto-safe-run-once <planId>`,
+        ].join('\n'));
         return;
     }
     /* Plan B (2026-05-03 단순화) — 슬래시 명령은 4개만 유지:
@@ -2964,9 +3131,7 @@ async function handleTelegramCommand(text: string): Promise<void> {
         return;
     }
     if (cmd === '/auto-safe-off') {
-        _autoSafeState.enabled = false;
-        _autoSafeState.activePlanId = '';
-        _autoSafeState.running = false;
+        _autoSafeDisable({ clearActivePlanId: true, clearRunning: true });
         _autoSafeState.lastError = '';
         await sendTelegramReport(`⏸ Safe Auto OFF`);
         return;
@@ -3022,15 +3187,12 @@ async function handleTelegramCommand(text: string): Promise<void> {
             lines.push(`다음 tick부터 자동으로 진행됩니다.`);
             lines.push('');
             lines.push(`확인:`);
+            lines.push(`- /status : 진행 상태 보기`);
+            lines.push(`- /results : 결과 보기`);
+            lines.push(`- /stop : 자동 진행 중단`);
             lines.push(`- /plan : 실행 흐름 보기`);
-            lines.push(`- /live : 현재 상태 보기`);
-            lines.push(`- /auto-safe-status : Safe Auto 상태 보기`);
-            lines.push(`- /auto-safe-off : 자동 진행 중단`);
-            lines.push('');
-            lines.push(`주의:`);
-            lines.push(`현재 /go, /status는 바로 사용할 수 있습니다.`);
-            lines.push(`/results, /stop은 다음 단계에서 추가 예정입니다.`);
-            lines.push(`지금은 /plan, /live, /status, /result <id>, /auto-safe-off를 사용할 수 있습니다.`);
+            lines.push(`- /live : 상세 상태 보기`);
+            lines.push(`- /help advanced : 고급 명령 보기`);
             await sendTelegramLong(lines.join('\n'));
         } catch (e: any) {
             await sendTelegramReport(`작업 시작 중 오류가 발생했어요: ${e?.message || e}`);
@@ -3394,7 +3556,7 @@ async function handleTelegramViaSecretary(userText: string): Promise<void> {
        일부 Telegram 진입 경로에서 `/run-plan ...` 이 일반 대화로
        흘러가는 경우가 있어, Secretary LLM 전에 명령 라우터로
        바로 되돌린다. */
-    if (/^\/run-plan(?:\s|$)/i.test(userText)) {
+    if (/^\/(?:run-plan|stop)(?:\s|$)/i.test(userText)) {
         await handleTelegramCommand(userText);
         return;
     }
@@ -6052,6 +6214,16 @@ function _autoSafeSetLastRun(now = new Date()): void {
 
 function _autoSafeSetError(errMsg: string): void {
   _autoSafeState.lastError = (errMsg || '').trim();
+}
+
+function _autoSafeDisable(opts?: { clearActivePlanId?: boolean; clearRunning?: boolean }): void {
+  _autoSafeState.enabled = false;
+  if (opts?.clearActivePlanId) {
+    _autoSafeState.activePlanId = '';
+  }
+  if (opts?.clearRunning) {
+    _autoSafeState.running = false;
+  }
 }
 
 function _autoSafeValidatePlanForOn(planId: string): { ok: boolean; message?: string } {
