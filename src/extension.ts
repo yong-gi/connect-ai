@@ -2621,24 +2621,23 @@ async function handleTelegramCommand(text: string): Promise<void> {
         const autoCycleEnabled = vscode.workspace.getConfiguration('connectAiLab').get<boolean>('autoCycleEnabled', true);
         const lines = [
             `🛡️ *Safe Auto 상태*`,
-            `- Safe Auto: OFF`,
-            `- active planId: ${snap.activePlanId ? `\`${snap.activePlanId}\`` : '없음'}`,
+            `- Safe Auto: ${_autoSafeState.enabled ? 'ON' : 'OFF'}`,
+            `- active planId: ${_autoSafeFormatActivePlanId()}`,
             `- running: ${snap.running ? 'true' : 'false'}`,
+            `- lastRunAt: ${_autoSafeState.lastRunAt ? new Date(_autoSafeState.lastRunAt).toLocaleString('ko-KR') : '없음'}`,
+            `- lastError: ${_autoSafeState.lastError ? _autoSafeState.lastError.slice(0, 120) : '없음'}`,
             `- 기존 Auto Cycle 설정: ${autoCycleEnabled ? 'ON' : 'OFF'}`,
             `- 다음 사용 가능 명령: /auto-safe-run-once <planId>`,
         ];
-        if (snap.lastTickAt > 0) {
-            lines.push(`- last tick: ${new Date(snap.lastTickAt).toLocaleString('ko-KR')}`);
-        }
-        if (snap.lastError) {
-            lines.push(`- last error: ${snap.lastError.slice(0, 120)}`);
-        }
         await sendTelegramLong(lines.join('\n'));
         return;
     }
     if (cmd === '/auto-safe-run-once') {
         const argPlan = rest.trim();
-        const resolved = _autoSafeResolvePlanId(argPlan);
+        let resolved = _autoSafeResolvePlanId(argPlan);
+        if (!argPlan && _autoSafeState.enabled && _autoSafeState.activePlanId) {
+            resolved = { planId: _autoSafeState.activePlanId };
+        }
         if (!resolved.planId) {
             if (resolved.reason === 'multiple') {
                 await sendTelegramReport([
@@ -2655,8 +2654,8 @@ async function handleTelegramCommand(text: string): Promise<void> {
             return;
         }
         const planId = resolved.planId;
-        if (_autoSafeRunning) {
-            await sendTelegramReport(`⚠️ 이미 auto-safe 실행 중입니다.\n- planId: \`${_autoSafeActivePlanId || planId}\``);
+        if (_autoSafeState.running) {
+            await sendTelegramReport(`⚠️ 이미 auto-safe 실행 중입니다.\n- planId: \`${_autoSafeState.activePlanId || planId}\``);
             return;
         }
         if (_runningRunPlanLocks.has(_RUN_PLAN_GLOBAL_LOCK) || _runningRunPlanLocks.has(planId)) {
@@ -2673,9 +2672,9 @@ async function handleTelegramCommand(text: string): Promise<void> {
             return;
         }
 
-        _autoSafeRunning = true;
-        _autoSafeActivePlanId = planId;
-        _autoSafeLastError = '';
+        _autoSafeState.running = true;
+        _autoSafeState.activePlanId = planId;
+        _autoSafeState.lastError = '';
         try {
             await sendTelegramReport([
                 `auto-safe run-once 시작`,
@@ -2686,7 +2685,7 @@ async function handleTelegramCommand(text: string): Promise<void> {
             const result = await _autoSafeRunOnceTick(planId, 2);
             if (!result) return;
 
-            _autoSafeLastTickAt = Date.now();
+            _autoSafeSetLastRun(new Date());
             const summaryLines = [
                 `✅ auto-safe run-once 완료`,
                 `- 완료: ${result.completed}개`,
@@ -2702,12 +2701,54 @@ async function handleTelegramCommand(text: string): Promise<void> {
             await sendTelegramLong(summaryLines.join('\n'));
         } catch (e: any) {
             const errMsg = _formatAxiosLikeError(e);
-            _autoSafeLastError = errMsg;
+            _autoSafeSetError(errMsg);
+            _autoSafeSetLastRun(new Date());
             await sendTelegramReport(`auto-safe run-once 중단: ${errMsg}`);
         } finally {
-            _autoSafeRunning = false;
-            _autoSafeActivePlanId = '';
+            _autoSafeState.running = false;
         }
+        return;
+    }
+    if (cmd === '/auto-safe-on') {
+        const planArg = rest.trim();
+        if (!planArg) {
+            await sendTelegramReport('사용법: `/auto-safe-on <planId>`\n예: `/auto-safe-on delegate-20260525054546-uyrz`');
+            return;
+        }
+        const resolved = _runPlanMatchPlanIdArg(planArg);
+        if (!resolved.planId) {
+            const plans = Array.from(new Set(readTracker().tasks.map(t => (t.planId || '').trim()).filter(Boolean)));
+            const matches = plans.filter(p => p === planArg || p.endsWith(planArg) || p.includes(planArg));
+            if (matches.length > 1) {
+                await sendTelegramReport(`플랜이 여러 개 매칭돼요: \`${planArg}\`\n/plan 으로 확인 후 다시 입력해 주세요.`);
+            } else {
+                await sendTelegramReport(`플랜을 찾지 못했어요: \`${planArg}\`\n/plan 으로 확인 후 다시 입력해 주세요.`);
+            }
+            return;
+        }
+        const planId = resolved.planId;
+        const validation = _autoSafeValidatePlanForOn(planId);
+        if (!validation.ok) {
+            await sendTelegramReport(validation.message || 'auto-safe를 켤 수 없어요.');
+            return;
+        }
+        _autoSafeState.enabled = true;
+        _autoSafeState.activePlanId = planId;
+        _autoSafeState.running = false;
+        _autoSafeState.lastError = '';
+        await sendTelegramReport([
+            `✅ Safe Auto ON`,
+            `- active planId: \`${planId}\``,
+            `- 다음 실행: /auto-safe-run-once`,
+        ].join('\n'));
+        return;
+    }
+    if (cmd === '/auto-safe-off') {
+        _autoSafeState.enabled = false;
+        _autoSafeState.activePlanId = '';
+        _autoSafeState.running = false;
+        _autoSafeState.lastError = '';
+        await sendTelegramReport(`⏸ Safe Auto OFF`);
         return;
     }
     if (cmd === '/research') {
@@ -3065,6 +3106,9 @@ function _buildCapabilityReport(): string {
    않고 실제 상태를 즉시. */
 function _buildDispatchStatusReport(): string {
     const lines: string[] = ['📊 *지금 상태*\n'];
+    try {
+        lines.push(`*🛡️ Safe Auto*: ${_autoSafeState.enabled ? 'ON' : 'OFF'}${_autoSafeState.activePlanId ? ` · \`${_autoSafeState.activePlanId}\`` : ''}`);
+    } catch { /* ignore */ }
     const provider = _activeChatProvider;
     const snap = provider?.getDispatchSnapshot?.();
     if (snap?.current) {
@@ -5267,10 +5311,13 @@ let _lastRunPlanStartedAt = 0;
 let _lastRunPlanStartedPlanId = '';
 let _lastRunPlanFinishedAt = 0;
 let _lastRunPlanFinishedPlanId = '';
-let _autoSafeRunning = false;
-let _autoSafeActivePlanId = '';
-let _autoSafeLastTickAt = 0;
-let _autoSafeLastError = '';
+const _autoSafeState = {
+  enabled: false,
+  activePlanId: '',
+  running: false,
+  lastRunAt: '',
+  lastError: '',
+};
 
 function _delegateSelectPlanId(): string | null {
   const all = readTracker().tasks.filter(t => (t.planId || '').trim());
@@ -5674,10 +5721,10 @@ function _runPlanIsAllDone(planId: string): boolean {
 
 function _autoSafeStatusSnapshot(): { running: boolean; activePlanId: string; lastTickAt: number; lastError: string } {
   return {
-    running: _autoSafeRunning,
-    activePlanId: _autoSafeActivePlanId,
-    lastTickAt: _autoSafeLastTickAt,
-    lastError: _autoSafeLastError,
+    running: _autoSafeState.running,
+    activePlanId: _autoSafeState.activePlanId,
+    lastTickAt: _autoSafeState.lastRunAt ? new Date(_autoSafeState.lastRunAt).getTime() : 0,
+    lastError: _autoSafeState.lastError,
   };
 }
 
@@ -5692,6 +5739,26 @@ function _autoSafeResolvePlanId(argPlan: string): { planId: string | null; reaso
   if (pendingPlans.length === 1) return { planId: pendingPlans[0] };
   if (pendingPlans.length > 1) return { planId: null, reason: 'multiple' };
   return { planId: null, reason: 'none' };
+}
+
+function _autoSafeSetLastRun(now = new Date()): void {
+  _autoSafeState.lastRunAt = now.toISOString();
+}
+
+function _autoSafeSetError(errMsg: string): void {
+  _autoSafeState.lastError = (errMsg || '').trim();
+}
+
+function _autoSafeValidatePlanForOn(planId: string): { ok: boolean; message?: string } {
+  const tasks = readTracker().tasks.filter(t => (t.planId || '').trim() === planId);
+  if (tasks.length === 0) return { ok: false, message: `플랜을 찾지 못했어요: \`${planId}\`\n/plan 으로 확인 후 다시 입력해 주세요.` };
+  if (tasks.some(t => t.status === 'failed')) return { ok: false, message: `실패 작업이 있는 플랜은 auto-safe를 켤 수 없어요.\n- planId: \`${planId}\`\n/retry 또는 /plan 으로 확인해 주세요.` };
+  if (!tasks.some(t => t.status === 'pending')) return { ok: false, message: `실행할 pending 작업이 없는 plan이에요.\n- planId: \`${planId}\`` };
+  return { ok: true };
+}
+
+function _autoSafeFormatActivePlanId(): string {
+  return _autoSafeState.activePlanId ? `\`${_autoSafeState.activePlanId}\`` : '없음';
 }
 
 async function _autoSafeRunOnceTick(planId: string, maxTasks = 2): Promise<{ completed: number; failed: number; blocked: boolean; remainingPending: number; nextReadyText: string; maxTasksHit: boolean } | null> {
@@ -5727,8 +5794,8 @@ async function _autoSafeRunOnceTick(planId: string, maxTasks = 2): Promise<{ com
       failed += 1;
       const latest = findTrackerTaskByIdArg(task.id) || task;
       const errMsg = _formatAxiosLikeError(e);
-      _autoSafeLastError = errMsg;
-      _autoSafeLastTickAt = Date.now();
+      _autoSafeSetError(errMsg);
+      _autoSafeSetLastRun(new Date());
       const evidence = (latest.evidence || '').trim();
       const failLines = [
         `auto-safe run-once 중단`,
