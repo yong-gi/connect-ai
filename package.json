@@ -255,6 +255,86 @@
           "default": 300,
           "description": "⏱ AI 응답 대기 시간 (초, 기본 300초 = 5분)"
         },
+        "connectAiLab.externalProvider": {
+          "type": "string",
+          "default": "",
+          "description": "External LLM provider. v1 supports openai-compatible only."
+        },
+        "connectAiLab.externalApiBaseUrl": {
+          "type": "string",
+          "default": "",
+          "description": "OpenAI-compatible API base URL."
+        },
+        "connectAiLab.externalApiKey": {
+          "type": "string",
+          "default": "",
+          "description": "API key for the external provider."
+        },
+        "connectAiLab.externalApiModel": {
+          "type": "string",
+          "default": "",
+          "description": "Default external model name."
+        },
+        "connectAiLab.externalTimeout": {
+          "type": "number",
+          "default": 300,
+          "description": "External LLM timeout in seconds."
+        },
+        "connectAiLab.plannerModel": {
+          "type": "string",
+          "default": "",
+          "description": "Planner model override for /go and /delegate."
+        },
+        "connectAiLab.workerModel": {
+          "type": "string",
+          "default": "",
+          "description": "Worker model override for run-safe."
+        },
+        "connectAiLab.researcherModel": {
+          "type": "string",
+          "default": "",
+          "description": "Optional override for the Researcher role."
+        },
+        "connectAiLab.writerModel": {
+          "type": "string",
+          "default": "",
+          "description": "Optional override for the Writer role."
+        },
+        "connectAiLab.businessModel": {
+          "type": "string",
+          "default": "",
+          "description": "Optional override for the Business role."
+        },
+        "connectAiLab.hyunbinModel": {
+          "type": "string",
+          "default": "",
+          "description": "Alias override for the Business role."
+        },
+        "connectAiLab.leoModel": {
+          "type": "string",
+          "default": "",
+          "description": "Optional override for the YouTube/Leo role."
+        },
+        "connectAiLab.instagramModel": {
+          "type": "string",
+          "default": "",
+          "description": "Optional override for the Instagram role."
+        },
+        "connectAiLab.designerModel": {
+          "type": "string",
+          "default": "",
+          "description": "Optional override for the Designer role."
+        },
+        "connectAiLab.codariModel": {
+          "type": "string",
+          "default": "",
+          "description": "Optional override for the Developer/Codari role."
+        },
+        "connectAiLab.yeongsukModel": {
+          "type": "string",
+          "default": "",
+          "description": "Optional override for the Secretary/Yeongsuk role."
+        },
         "connectAiLab.streamFirstTokenTimeoutSec": {
           "type": "number",
           "default": 240,

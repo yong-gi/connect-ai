@@ -2368,6 +2368,231 @@ async function _quickLLMCall(
     return r.data?.message?.content?.toString().trim() || '';
 }
 
+type _ModelRoutingPurpose = 'planner' | 'ceo' | 'worker';
+
+function _trimText(value: string, maxLen: number): string {
+    const compact = (value || '').replace(/\s+/g, ' ').trim();
+    if (!compact) return '';
+    return compact.length > maxLen ? compact.slice(0, maxLen) : compact;
+}
+
+function _readModelRoutingConfig() {
+    const cfg = vscode.workspace.getConfiguration('connectAiLab');
+    const read = (key: string): string => String(cfg.get<string>(key, '') || '').trim();
+    const clampSeconds = (raw: unknown, fallback: number): number => {
+        const n = typeof raw === 'number' && isFinite(raw) ? raw : fallback;
+        return Math.min(1800, Math.max(5, n));
+    };
+    return {
+        externalProvider: read('externalProvider'),
+        externalApiBaseUrl: read('externalApiBaseUrl'),
+        externalApiKey: read('externalApiKey'),
+        externalApiModel: read('externalApiModel'),
+        externalTimeout: clampSeconds(cfg.get<number>('externalTimeout', 300), 300) * 1000,
+        plannerModel: read('plannerModel'),
+        workerModel: read('workerModel'),
+        researcherModel: read('researcherModel'),
+        writerModel: read('writerModel'),
+        businessModel: read('businessModel'),
+        hyunbinModel: read('hyunbinModel'),
+        leoModel: read('leoModel'),
+        instagramModel: read('instagramModel'),
+        designerModel: read('designerModel'),
+        codariModel: read('codariModel'),
+        yeongsukModel: read('yeongsukModel'),
+        ceoModel: read('ceoModel'),
+        defaultModel: getConfig().defaultModel || '',
+        localTimeout: getConfig().timeout,
+    };
+}
+
+function _isOpenAICompatibleExternalProvider(provider: string): boolean {
+    const p = (provider || '').trim().toLowerCase();
+    return p === 'openai-compatible' || p === 'openai' || p === 'openai-compatible-rest';
+}
+
+function _normalizeOpenAICompatibleBaseUrl(baseUrl: string): string {
+    let base = (baseUrl || '').trim().replace(/\/+$/g, '');
+    if (!base) return '';
+    if (/\/chat\/completions$/i.test(base)) {
+        return base.replace(/\/chat\/completions$/i, '');
+    }
+    if (/\/v1$/i.test(base)) return base;
+    return `${base}/v1`;
+}
+
+function _roleModelOverride(roleId: string, cfg = _readModelRoutingConfig()): string {
+    const role = (roleId || '').trim().toLowerCase();
+    switch (role) {
+        case 'planner':
+            return cfg.plannerModel;
+        case 'ceo':
+            return cfg.ceoModel;
+        case 'researcher':
+            return cfg.researcherModel;
+        case 'writer':
+            return cfg.writerModel;
+        case 'business':
+        case 'hyunbin':
+            return cfg.businessModel || cfg.hyunbinModel;
+        case 'youtube':
+        case 'leo':
+            return cfg.leoModel;
+        case 'instagram':
+        case 'instargram':
+        case 'instagram_manager':
+        case 'sns':
+            return cfg.instagramModel;
+        case 'designer':
+        case 'design':
+            return cfg.designerModel;
+        case 'developer':
+        case 'codari':
+            return cfg.codariModel;
+        case 'secretary':
+        case 'yeongsuk':
+            return cfg.yeongsukModel;
+        default:
+            return '';
+    }
+}
+
+function _resolveModelForPurpose(roleId: string, purpose: _ModelRoutingPurpose): {
+  model: string;
+  externalModel: string;
+  localFallbackModel: string;
+  useExternal: boolean;
+  externalEnabled: boolean;
+  externalTimeout: number;
+  externalBaseUrl: string;
+    externalApiKey: string;
+} {
+    const cfg = _readModelRoutingConfig();
+    const externalEnabled = _isOpenAICompatibleExternalProvider(cfg.externalProvider) &&
+        !!cfg.externalApiBaseUrl &&
+        !!cfg.externalApiKey;
+    const role = (roleId || '').trim().toLowerCase();
+
+    const externalModel = (() => {
+        if (purpose === 'planner') {
+            return cfg.plannerModel || cfg.ceoModel || cfg.externalApiModel || '';
+        }
+        if (purpose === 'ceo') {
+            return cfg.ceoModel || cfg.plannerModel || cfg.externalApiModel || '';
+        }
+        return _roleModelOverride(role, cfg) || cfg.workerModel || cfg.externalApiModel || '';
+    })().trim();
+
+    const model = (() => {
+        if (purpose === 'planner') {
+            return cfg.plannerModel || cfg.ceoModel || cfg.externalApiModel || cfg.defaultModel;
+        }
+        if (purpose === 'ceo') {
+            return cfg.ceoModel || cfg.plannerModel || cfg.externalApiModel || cfg.defaultModel;
+        }
+        return _roleModelOverride(role, cfg) || cfg.workerModel || cfg.externalApiModel || cfg.defaultModel;
+    })().trim();
+
+    const localFallbackModel = (() => {
+        if (purpose === 'planner') return (cfg.ceoModel || cfg.defaultModel || '').trim();
+        if (purpose === 'ceo') return (cfg.ceoModel || cfg.defaultModel || '').trim();
+        return (cfg.defaultModel || cfg.ceoModel || '').trim();
+    })();
+
+    return {
+        model,
+        externalModel,
+        localFallbackModel,
+        useExternal: externalEnabled && !!externalModel,
+        externalEnabled,
+        externalTimeout: cfg.externalTimeout || cfg.localTimeout,
+        externalBaseUrl: cfg.externalApiBaseUrl,
+        externalApiKey: cfg.externalApiKey,
+    };
+}
+
+async function _callOpenAICompatibleChatCompletion(opts: {
+    baseUrl: string;
+    apiKey: string;
+    model: string;
+    systemPrompt: string;
+    userPrompt: string;
+    maxTokens: number;
+    timeoutMs: number;
+}): Promise<string> {
+    const base = _normalizeOpenAICompatibleBaseUrl(opts.baseUrl);
+    if (!base) throw new Error('external API base URL is empty');
+    const model = (opts.model || '').trim();
+    if (!model) throw new Error('external API model is empty');
+    const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+    };
+    if ((opts.apiKey || '').trim()) {
+        headers.Authorization = `Bearer ${opts.apiKey.trim()}`;
+    }
+    const payload = {
+        model,
+        messages: [
+            { role: 'system', content: opts.systemPrompt },
+            { role: 'user', content: opts.userPrompt },
+        ],
+        temperature: 0.2,
+        stream: false,
+        max_tokens: opts.maxTokens,
+    };
+    const r = await axios.post(`${base}/chat/completions`, payload, {
+        timeout: opts.timeoutMs,
+        headers,
+        validateStatus: () => true,
+    });
+    if (r.status < 200 || r.status >= 300) {
+        const detail = r.data?.error?.message || r.data?.error || r.data?.message || `HTTP ${r.status}`;
+        throw new Error(String(detail).slice(0, 300));
+    }
+    const content = r.data?.choices?.[0]?.message?.content?.toString?.() || r.data?.choices?.[0]?.message?.content || '';
+    const trimmed = String(content || '').trim();
+    if (!trimmed) throw new Error('external API returned empty content');
+    return trimmed;
+}
+
+async function _callRoleLLMWithFallback(opts: {
+    roleId: string;
+    purpose: _ModelRoutingPurpose;
+    externalSystemPrompt: string;
+    externalUserPrompt: string;
+    localSystemPrompt: string;
+    localUserPrompt: string;
+    maxTokens: number;
+    localModel?: string;
+}): Promise<{ text: string; model: string; source: 'external' | 'local' | 'external-fallback-local'; fallbackError?: string }> {
+    const routing = _resolveModelForPurpose(opts.roleId, opts.purpose);
+    const localModel = (opts.localModel || routing.localFallbackModel || getConfig().defaultModel || '').trim();
+    if (routing.useExternal) {
+        try {
+            const text = await _callOpenAICompatibleChatCompletion({
+                baseUrl: routing.externalBaseUrl,
+                apiKey: routing.externalApiKey,
+                model: routing.externalModel || routing.model,
+                systemPrompt: opts.externalSystemPrompt,
+                userPrompt: opts.externalUserPrompt,
+                maxTokens: opts.maxTokens,
+                timeoutMs: routing.externalTimeout,
+            });
+            return { text, model: routing.externalModel || routing.model, source: 'external' };
+        } catch (e: any) {
+            const fallbackText = await _quickLLMCall(opts.localSystemPrompt, opts.localUserPrompt, opts.maxTokens, { model: localModel });
+            return {
+                text: fallbackText,
+                model: localModel,
+                source: 'external-fallback-local',
+                fallbackError: _formatAxiosLikeError(e),
+            };
+        }
+    }
+    const text = await _quickLLMCall(opts.localSystemPrompt, opts.localUserPrompt, opts.maxTokens, { model: localModel });
+    return { text, model: localModel, source: 'local' };
+}
+
 const CEO_CLASSIFIER_PROMPT = _loadPrompt('ceo-classifier.md');
 const SECRETARY_TELEGRAM_PROMPT = _loadPrompt('secretary-telegram.md');
 async function classifyToAgent(text: string): Promise<string> {
@@ -3301,9 +3526,17 @@ async function handleTelegramCommand(text: string): Promise<void> {
         try {
             const cfg = getConfig();
             const ceoModel = (vscode.workspace.getConfiguration('connectAiLab').get<string>('ceoModel') || '').trim();
-            const systemPrompt = buildCeoTelegramSystemPrompt();
-            const raw = await _quickLLMCall(systemPrompt, question, 720, { model: ceoModel || cfg.defaultModel || '' });
-            const answer = sanitizeCeoTelegramText(raw).trim();
+            const rawResult = await _callRoleLLMWithFallback({
+                roleId: 'ceo',
+                purpose: 'ceo',
+                externalSystemPrompt: buildExternalCeoTelegramSystemPrompt(question),
+                externalUserPrompt: question,
+                localSystemPrompt: buildCeoTelegramSystemPrompt(),
+                localUserPrompt: question,
+                maxTokens: 720,
+                localModel: ceoModel || cfg.defaultModel || '',
+            });
+            const answer = sanitizeCeoTelegramText(rawResult.text).trim();
             const finalText = answer || '브레인에 근거 없음\n\n## CEO 판단\n- 브레인 근거를 찾지 못해 판단을 만들 수 없습니다.\n\n## 확인 필요\n- 관련 회사 문서와 최근 작업 기록을 다시 확인해야 합니다.';
             await sendTelegramLong(finalText);
         } catch (e: any) {
@@ -5736,10 +5969,21 @@ async function _delegateCreatePlan(goal: string): Promise<{
   preview: string;
 }> {
   const systemPrompt = buildDelegateTelegramSystemPrompt();
-  const model = getCeoPlanningModel();
   const planId = _delegateNewPlanId();
   const isTemplatePlan = _delegateIsCoursePilotTemplateGoal(goal);
-  const raw = await _quickLLMCall(systemPrompt, goal, 720, { model });
+  const localModel = getCeoPlanningModel();
+  const externalPrompt = buildExternalPlannerTelegramSystemPrompt(goal);
+  const rawResult = await _callRoleLLMWithFallback({
+    roleId: 'planner',
+    purpose: 'planner',
+    externalSystemPrompt: externalPrompt,
+    externalUserPrompt: goal,
+    localSystemPrompt: systemPrompt,
+    localUserPrompt: goal,
+    maxTokens: 720,
+    localModel,
+  });
+  const raw = rawResult.text;
   const parsed = _delegateParsePlan(raw);
   const preview = sanitizeCeoTelegramText(raw).trim().slice(0, 1500) || '(미리보기 없음)';
   if (!isTemplatePlan && (!parsed || !Array.isArray(parsed.tasks) || parsed.tasks.length === 0)) {
@@ -6030,7 +6274,7 @@ function _truncateResultText(text: string, maxLen = 12000): string {
 
 function _runSafeAllowedAgentId(task: TrackerTask): string {
   const first = Array.isArray(task.agentIds) && task.agentIds.length > 0 ? String(task.agentIds[0] || '').trim().toLowerCase() : '';
-  return first && ['researcher', 'business', 'writer', 'developer', 'ceo', 'secretary'].includes(first) ? first : 'ceo';
+  return first && ['researcher', 'business', 'writer', 'youtube', 'instagram', 'designer', 'developer', 'ceo', 'secretary'].includes(first) ? first : 'ceo';
 }
 
 function _runSafeTaskBucket(task: TrackerTask): string {
@@ -6099,6 +6343,9 @@ function _runSafeBuildSystemPrompt(agentId: string, task: TrackerTask): string {
     researcher: '핵심 가설 3개 / 타깃 니즈 3개 / 강의 주제 후보 3개 / 다음 확인 필요 2개',
     business: '상품 구조 / 가격 전략 / 운영 방식 / 리스크',
     writer: '커리큘럼 초안 / 모집글 핵심 문구 / CTA',
+    youtube: '채널 방향 / 영상 주제 / 업로드 운영 / 성장 포인트',
+    instagram: '콘텐츠 기획 / 반응 포인트 / 배포 흐름 / 포맷 제안',
+    designer: '브랜드 톤앤매너 / 시각 자산 / 디자인 방향 / 개선 포인트',
     developer: '구현 계획 / 자동화 포인트 / 리스크',
     ceo: '최종 판단 / 우선순위 / 다음 액션',
     secretary: '요약 / 정리 / 체크리스트',
@@ -6133,18 +6380,26 @@ function _runSafeBuildSystemPrompt(agentId: string, task: TrackerTask): string {
 async function _runSafeExecuteTask(task: TrackerTask): Promise<{ ok: boolean; message: string }> {
   const agentId = _runSafeAllowedAgentId(task);
   const cfg = getConfig();
-  const systemPrompt = _runSafeBuildSystemPrompt(agentId, task);
   const userPrompt = [
     `작업 제목: ${task.title}`,
     `설명: ${task.description || '(없음)'}`,
     `이 작업을 안전 실행용 텍스트 결과로 정리하세요.`,
     `반드시 외부 도구 없이, 텍스트 결과만 작성하세요.`,
   ].join('\n');
-  const modelOverride = agentId === 'ceo'
-    ? (vscode.workspace.getConfiguration('connectAiLab').get<string>('ceoModel') || '').trim() || cfg.defaultModel || ''
-    : cfg.defaultModel || '';
-  const raw = await _quickLLMCall(systemPrompt, userPrompt, 700, { model: modelOverride });
-  const cleaned = sanitizeCeoTelegramText(raw).trim();
+  const ceoModel = (vscode.workspace.getConfiguration('connectAiLab').get<string>('ceoModel') || '').trim();
+  const externalResult = await _callRoleLLMWithFallback({
+    roleId: agentId,
+    purpose: 'worker',
+    externalSystemPrompt: _runSafeBuildSystemPrompt(agentId, task),
+    externalUserPrompt: userPrompt,
+    localSystemPrompt: _runSafeBuildSystemPrompt(agentId, task),
+    localUserPrompt: userPrompt,
+    maxTokens: 700,
+    localModel: agentId === 'ceo'
+      ? (ceoModel || cfg.defaultModel || '')
+      : (cfg.defaultModel || ''),
+  });
+  const cleaned = sanitizeCeoTelegramText(externalResult.text).trim();
   const resultText = cleaned || '결과 없음';
   const bucket = _runSafeTaskBucket(task);
   const sessionsRoot = path.join(getCompanyDir(), 'sessions', bucket);
@@ -6160,6 +6415,9 @@ async function _runSafeExecuteTask(task: TrackerTask): Promise<{ ok: boolean; me
     `- agentId: ${agentId}`,
     `- createdAt: ${task.createdAt}`,
     `- completedAt: ${completedAt}`,
+    `- llmModel: ${externalResult.model}`,
+    `- llmSource: ${externalResult.source}`,
+    externalResult.fallbackError ? `- fallbackError: ${externalResult.fallbackError}` : '',
     `- resultSummary: ${_runSafeSummarize(resultText)}`,
     ``,
     `## Result`,
@@ -9440,8 +9698,114 @@ function buildCeoTelegramSystemPrompt(): string {
   ].join('\n');
 }
 
-const DELEGATE_ALLOWED_AGENT_IDS = new Set(['researcher', 'business', 'writer', 'developer', 'ceo', 'secretary']);
-const DELEGATE_ROLE_ORDER = ['researcher', 'business', 'writer', 'developer', 'ceo', 'secretary'] as const;
+function _buildExternalRoutingContext(opts: {
+  focus: string;
+  roleLabel: string;
+  task?: TrackerTask;
+}): string {
+  const dir = getCompanyDir();
+  const parts: string[] = [];
+  const focus = _trimText(opts.focus, 420);
+  if (focus) parts.push(`[focus]\n${focus}`);
+
+  try {
+    const identity = _safeReadText(path.join(dir, '_shared', 'identity.md')).trim();
+    if (identity) parts.push(`[identity]\n${identity.slice(0, 220)}`);
+  } catch { /* ignore */ }
+  try {
+    const goals = _safeReadText(path.join(dir, '_shared', 'goals.md')).trim();
+    if (goals) parts.push(`[goals]\n${goals.slice(0, 220)}`);
+  } catch { /* ignore */ }
+  try {
+    const decisions = _safeReadText(path.join(dir, '_shared', 'decisions.md')).trim();
+    if (decisions) parts.push(`[decisions]\n${decisions.slice(0, 260)}`);
+  } catch { /* ignore */ }
+  try {
+    const tracker = trackerToMarkdown({ onlyOpen: true, max: 4 }).trim();
+    if (tracker) parts.push(`[tracker open tasks]\n${tracker.slice(0, 800)}`);
+  } catch { /* ignore */ }
+  try {
+    const recentReports = readRecentSessionReports(1, 200).trim();
+    if (recentReports) parts.push(`[recent result summary]\n${recentReports.slice(0, 500)}`);
+  } catch { /* ignore */ }
+
+  if (opts.task) {
+    const task = opts.task;
+    const planId = (task.planId || '').trim();
+    parts.push([
+      `[current task]`,
+      `- role: ${opts.roleLabel}`,
+      `- taskId: ${task.id}`,
+      `- title: ${task.title}`,
+      `- description: ${(task.description || '(없음)').slice(0, 500)}`,
+      `- planId: ${planId || '(없음)'}`,
+      `- dependsOn: ${Array.isArray(task.dependsOn) && task.dependsOn.length > 0 ? task.dependsOn.join(', ') : '(없음)'}`,
+      `- stage: ${typeof task.stage === 'undefined' ? '(없음)' : String(task.stage)}`,
+      planId ? `- same plan summary:\n${_runSafePlanSummary(task).slice(0, 700)}` : '',
+      `- completed deps:\n${_runSafeDepsSummary(task).slice(0, 700)}`,
+    ].filter(Boolean).join('\n'));
+  }
+
+  return parts.join('\n\n');
+}
+
+function buildExternalPlannerTelegramSystemPrompt(goal: string): string {
+  const company = readCompanyName();
+  const context = _buildExternalRoutingContext({ focus: goal, roleLabel: 'planner' });
+  return [
+    `[Connect AI external planner]`,
+    `You are the CEO planner for tracker registration only.`,
+    `Break one big goal into 1-5 tracker tasks.`,
+    `Return JSON only. No markdown. No prose. No code fences. No commentary.`,
+    `Do not execute anything. Do not call tools. Do not mention run_command, create_file, edit_file, Python, API, YouTube, Leo.`,
+    `Allowed agentId values: researcher, business, writer, youtube, instagram, designer, developer, secretary, ceo.`,
+    `If uncertain about agentId, fall back to ceo.`,
+    `Required task fields: title, description, agentId, priority.`,
+    `Optional field: dueAt (ISO 8601 or null).`,
+    `Max task count: 5.`,
+    `Use Korean titles and descriptions when the user input is Korean.`,
+    `Role responsibilities:`,
+    `- researcher: market, customer, trend, fact-check`,
+    `- business: product structure, pricing, monetization, operations, strategy`,
+    `- writer: copy, hook, script, landing, recruitment text`,
+    `- youtube: channel plan, video topics, upload operation`,
+    `- instagram: Instagram content, engagement, post planning`,
+    `- designer: brand, visual assets, design system`,
+    `- developer: automation, implementation, verification`,
+    `- secretary: schedule, todo, contact, company communication`,
+    `- ceo: coordination, priority, final decision`,
+    `Company: ${company || 'Unknown'}`,
+    '',
+    `[context]`,
+    context || '(empty)',
+    '',
+    `Output schema: {"summary":"...", "tasks":[{"title":"...","description":"...","agentId":"researcher","priority":"normal","dueAt":null}]}`,
+  ].join('\n');
+}
+
+function buildExternalCeoTelegramSystemPrompt(question: string): string {
+  const company = readCompanyName();
+  const context = _buildExternalRoutingContext({ focus: question, roleLabel: 'ceo' });
+  return [
+    `[Connect AI external CEO]`,
+    `You are the CEO. Make a short, grounded decision based on the company context below.`,
+    `Do not execute tools. Do not mention run_command, create_file, edit_file, Python, API, YouTube, Leo.`,
+    `Keep the answer concise and practical.`,
+    `If evidence is weak, say so clearly.`,
+    `Company: ${company || 'Unknown'}`,
+    '',
+    `[context]`,
+    context || '(empty)',
+    '',
+    `[output]`,
+    `- Brain evidence`,
+    `- CEO decision`,
+    `- Next verification`,
+  ].join('\n');
+}
+
+const DELEGATE_ALLOWED_AGENT_IDS = new Set(['researcher', 'business', 'writer', 'youtube', 'instagram', 'designer', 'developer', 'secretary', 'ceo']);
+const DELEGATE_ROLE_ORDER = ['researcher', 'business', 'writer', 'youtube', 'instagram', 'designer', 'developer', 'secretary', 'ceo'] as const;
 const DELEGATE_KOREAN_RE = /[가-힣]/;
 const DELEGATE_BUSINESS_GOAL_RE = /(사업|강의|파일럿|수익화|가격|상품|운영|런칭|출시|세일즈|모집|monetiz|pricing|pilot|launch|sales|course|class|workshop)/i;
 const DELEGATE_WRITER_GOAL_RE = /(모집|모집글|랜딩|상세페이지|커리큘럼|홍보|카피|문구|소개글|신청|landing page|curriculum|copy|promotional)/i;
@@ -9464,6 +9828,21 @@ const DELEGATE_ROLE_DEFAULTS: Record<string, { title: string; description: strin
   writer: {
     title: '파일럿 강의 커리큘럼과 모집글 초안 작성',
     description: '파일럿 모집글, 상세페이지, 커리큘럼 초안, 홍보 문구를 한국어로 정리한다.',
+    priority: 'normal',
+  },
+  youtube: {
+    title: '유튜브 채널 주제와 운영 방향 정리',
+    description: '유튜브 채널의 주제, 영상 방향, 업로드 운영 방식을 정리한다.',
+    priority: 'normal',
+  },
+  instagram: {
+    title: '인스타 콘텐츠 기획과 반응 포인트 정리',
+    description: '인스타 콘텐츠 기획, 반응 포인트, 배포 흐름을 정리한다.',
+    priority: 'normal',
+  },
+  designer: {
+    title: '브랜드 시각 자산과 디자인 방향 정리',
+    description: '브랜드 톤앤매너, 시각 자산, 디자인 방향을 정리한다.',
     priority: 'normal',
   },
   developer: {
@@ -9511,7 +9890,7 @@ function buildDelegateTelegramSystemPrompt(): string {
     `Return JSON only. No markdown. No prose. No code fences. No commentary.`,
     `Do not execute anything. Do not call tools. Do not mention run_command, create_file, edit_file, Python, API, YouTube, Leo.`,
     `Use the brain context below. If evidence is weak, keep the task small and conservative.`,
-    `Allowed agentId values: researcher, business, writer, developer, ceo, secretary.`,
+    `Allowed agentId values: researcher, business, writer, youtube, instagram, designer, developer, secretary, ceo.`,
     `If uncertain about agentId, fall back to ceo.`,
     `Required task fields: title, description, agentId, priority.`,
     `Optional field: dueAt (ISO 8601 or null).`,
@@ -9521,7 +9900,11 @@ function buildDelegateTelegramSystemPrompt(): string {
     `- Researcher: 시장, 고객, 주제, 경쟁/사례 조사`,
     `- Business: 상품 구조, 가격 전략, 수익 모델, 운영 방식`,
     `- Writer: 모집글, 상세페이지, 커리큘럼 초안, 홍보 문구`,
+    `- YouTube: 채널 기획, 영상 주제, 업로드 운영`,
+    `- Instagram: 인스타 콘텐츠, 반응, 배포`,
+    `- Designer: 브랜드, 시각 자산, 디자인`,
     `- Developer: 자동화/도구/웹/시스템 구현이 필요한 경우만`,
+    `- Secretary: 일정, 할 일, 연락, 정리`,
     `- CEO: 최종 실행계획, 우선순위, 의사결정, 조율`,
     `If the goal includes a course, pilot, monetization, pricing, launch, or sales plan, include at least one business task.`,
     `If the goal includes recruitment, landing page, curriculum, or promotional copy, include at least one writer task.`,
@@ -9779,7 +10162,7 @@ function _delegateNormalizeTasks(goal: string, parsed: { summary?: string; tasks
       if (goalHasKorean && (!DELEGATE_KOREAN_RE.test(title) || !DELEGATE_KOREAN_RE.test(description))) continue;
       const combined = `${title}\n${description}`;
       if (_delegateLooksLikePostingTask(combined) || _delegateLooksLikeUnsafeCeoTask(combined)) continue;
-      if (!['developer', 'secretary'].includes(_delegateNormalizeAgentId(normalized.agentId))) continue;
+      if (!DELEGATE_ALLOWED_AGENT_IDS.has(_delegateNormalizeAgentId(normalized.agentId))) continue;
       if (_delegateHasSemanticOverlap(combined, `${result.map(t => `${t.title}\n${t.description}`).join('\n')}`)) continue;
       const key = title.toLowerCase();
       if (!key || seenTitles.has(key)) continue;
