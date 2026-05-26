@@ -1978,8 +1978,8 @@ const TELEGRAM_HELP = `🤖 *Connect AI 사용법*
 \`/help advanced\`
 
 주의:
-현재 \`/status\`, \`/results\`, \`/stop\`은 다음 단계에서 추가 예정입니다.
-지금은 \`/go\`만 바로 사용할 수 있습니다.`;
+현재 \`/go\`, \`/status\`는 바로 사용할 수 있습니다.
+\`/results\`, \`/stop\`은 다음 단계에서 추가 예정입니다.`;
 
 function _buildTelegramAdvancedHelp(): string {
   return [
@@ -1987,6 +1987,7 @@ function _buildTelegramAdvancedHelp(): string {
     '',
     '*모바일 시작*',
     '- `/go`',
+    '- `/status`',
     '',
     '*작업 생성*',
     '- `/delegate`',
@@ -2021,6 +2022,173 @@ function _buildTelegramAdvancedHelp(): string {
     '',
     '일반 사용자는 `/go` 중심으로 쓰면 됩니다.',
     '향후 모바일용 상위 명령어: `/go`, `/status`, `/results`, `/stop`',
+  ].join('\n');
+}
+
+function _statusPlanGoalText(tasks: TrackerTask[]): string {
+  const first = tasks.slice().sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime())[0];
+  if (!first) return '없음';
+  const desc = (first.description || '').trim();
+  const m = desc.match(/^\[delegate goal\]\s*(.+)$/m);
+  const goal = (m && m[1].trim()) ? m[1].trim() : first.title || '없음';
+  return goal.length > 110 ? `${goal.slice(0, 107)}...` : goal;
+}
+
+function _statusPickPlanId(): { planId: string | null; source: string } {
+  const tasks = readTracker().tasks;
+  const safeActive = (_autoSafeState.enabled && _autoSafeState.activePlanId) ? _autoSafeState.activePlanId.trim() : '';
+  if (safeActive) return { planId: safeActive, source: 'safe-active' };
+
+  const active = (_autoSafeState.activePlanId || '').trim();
+  if (active) return { planId: active, source: 'active' };
+
+  const openPending = tasks
+    .filter(t => t.status === 'pending' && (t.planId || '').trim())
+    .map(t => (t.planId || '').trim());
+  if (openPending.length > 0) {
+    const unique = Array.from(new Set(openPending));
+    unique.sort((a, b) => {
+      const ta = tasks.filter(t => (t.planId || '').trim() === a)
+        .reduce((m, t) => Math.max(m, new Date(t.createdAt).getTime()), 0);
+      const tb = tasks.filter(t => (t.planId || '').trim() === b)
+        .reduce((m, t) => Math.max(m, new Date(t.createdAt).getTime()), 0);
+      return tb - ta;
+    });
+    return { planId: unique[0] || null, source: 'pending' };
+  }
+
+  const doneTasks = tasks.filter(t => t.status === 'done' && (t.planId || '').trim());
+  if (doneTasks.length > 0) {
+    const byPlan = new Map<string, number>();
+    for (const task of doneTasks) {
+      const planId = (task.planId || '').trim();
+      const ts = new Date(task.completedAt || task.createdAt).getTime();
+      byPlan.set(planId, Math.max(byPlan.get(planId) || 0, ts));
+    }
+    const sorted = Array.from(byPlan.entries()).sort((a, b) => b[1] - a[1]);
+    return { planId: sorted[0]?.[0] || null, source: 'done' };
+  }
+
+  return { planId: null, source: 'none' };
+}
+
+function _statusCollectPlanTasks(planId: string): TrackerTask[] {
+  return readTracker().tasks
+    .filter(t => (t.planId || '').trim() === planId)
+    .slice()
+    .sort((a, b) => {
+      const sa = _delegatePlanStageSortValue(a.stage);
+      const sb = _delegatePlanStageSortValue(b.stage);
+      if (sa !== sb) return sa - sb;
+      return new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime();
+    });
+}
+
+function _statusTaskIsReady(task: TrackerTask, byId: Map<string, TrackerTask>): boolean {
+  const deps = Array.isArray(task.dependsOn) ? task.dependsOn.filter(Boolean) : [];
+  for (const depId of deps) {
+    const dep = byId.get(depId) || findTrackerTaskByIdArg(depId);
+    if (!dep || dep.status !== 'done') return false;
+  }
+  return true;
+}
+
+function _statusStageLabel(tasks: TrackerTask[], byId: Map<string, TrackerTask>): string {
+  if (tasks.length === 0) return '대기';
+  if (tasks.every(t => t.status === 'cancelled')) return '취소';
+  if (tasks.some(t => t.status === 'failed')) return '실패';
+  if (tasks.some(t => t.status === 'in_progress')) return '진행 중';
+  if (tasks.some(t => t.status === 'pending' && _statusTaskIsReady(t, byId))) return '바로 실행 가능';
+  if (tasks.some(t => t.status === 'pending')) return '대기';
+  if (tasks.every(t => t.status === 'done' || t.status === 'cancelled')) return tasks.every(t => t.status === 'done') ? '완료' : '취소';
+  return '대기';
+}
+
+function _statusBuildReport(): string {
+  const picked = _statusPickPlanId();
+  if (!picked.planId) {
+    return [
+      '진행 상태',
+      '',
+      '진행 중인 작업이 없어요.',
+      '',
+      '다음 명령:',
+      '- /go : 새 작업 시작',
+      '- /help advanced : 고급 명령 보기',
+    ].join('\n');
+  }
+
+  const tasks = _statusCollectPlanTasks(picked.planId);
+  if (tasks.length === 0) {
+    return [
+      '진행 상태',
+      '',
+      '진행 중인 작업이 없어요.',
+      '',
+      '다음 명령:',
+      '- /go : 새 작업 시작',
+      '- /help advanced : 고급 명령 보기',
+    ].join('\n');
+  }
+
+  const byId = new Map(tasks.map(t => [t.id, t]));
+  const stages = Array.from(new Set(tasks.map(t => _delegatePlanStageSortValue(t.stage)))).sort((a, b) => a - b);
+  const stageLines = stages.map(stageNo => {
+    const stageTasks = tasks.filter(t => _delegatePlanStageSortValue(t.stage) === stageNo);
+    const label = _statusStageLabel(stageTasks, byId);
+    return `- ${stageNo}단계 ${label}`;
+  });
+
+  const totals = {
+    done: tasks.filter(t => t.status === 'done').length,
+    inProgress: tasks.filter(t => t.status === 'in_progress').length,
+    pending: tasks.filter(t => t.status === 'pending').length,
+    failed: tasks.filter(t => t.status === 'failed').length,
+    cancelled: tasks.filter(t => t.status === 'cancelled').length,
+  };
+  const readyTasks = tasks.filter(t => t.status === 'pending' && _statusTaskIsReady(t, byId)).slice(0, 3);
+  const nextTasks = readyTasks.length > 0
+    ? readyTasks.map(t => {
+        const a = (t.agentIds && t.agentIds[0]) ? AGENTS[t.agentIds[0]] : null;
+        const owner = a ? a.name : (t.agentIds && t.agentIds[0]) || 'Unknown';
+        return `- ${owner} ${t.id.slice(-9)} ${t.title.slice(0, 42)}`;
+      }).join('\n')
+    : '- 없음';
+
+  return [
+    '진행 상태',
+    '',
+    `목표:`,
+    _statusPlanGoalText(tasks),
+    '',
+    'Safe Auto:',
+    `- 상태: ${_autoSafeState.enabled ? 'ON' : 'OFF'}`,
+    `- running: ${_autoSafeState.running ? 'true' : 'false'}`,
+    `- active planId: ${_autoSafeState.activePlanId || picked.planId}`,
+    `- lastRunAt: ${_autoSafeState.lastRunAt ? new Date(_autoSafeState.lastRunAt).toLocaleString('ko-KR') : '없음'}`,
+    `- lastError: ${_autoSafeState.lastError ? _autoSafeState.lastError.slice(0, 120) : '없음'}`,
+    '',
+    '플랜:',
+    `- planId: ${picked.planId}`,
+    `- 전체 작업: ${tasks.length}개`,
+    `- 완료: ${totals.done}개`,
+    `- 진행 중: ${totals.inProgress}개`,
+    `- 대기: ${totals.pending}개`,
+    `- 실패: ${totals.failed}개`,
+    `- 취소: ${totals.cancelled}개`,
+    '',
+    '현재 단계:',
+    ...stageLines,
+    '',
+    '다음 작업:',
+    nextTasks,
+    '',
+    '다음 명령:',
+    '- /results : 결과 보기 예정',
+    '- /result <id> : 특정 결과 보기',
+    '- /stop : 자동 진행 중단 예정',
+    '- /live : 상세 상태',
+    '- /help advanced : 고급 명령',
   ].join('\n');
 }
 
@@ -2099,6 +2267,10 @@ async function handleTelegramCommand(text: string): Promise<void> {
         } else {
             await sendTelegramReport(TELEGRAM_HELP);
         }
+        return;
+    }
+    if (cmd === '/status') {
+        await sendTelegramLong(_statusBuildReport());
         return;
     }
     /* Plan B (2026-05-03 단순화) — 슬래시 명령은 4개만 유지:
@@ -2856,8 +3028,9 @@ async function handleTelegramCommand(text: string): Promise<void> {
             lines.push(`- /auto-safe-off : 자동 진행 중단`);
             lines.push('');
             lines.push(`주의:`);
-            lines.push(`현재 /status, /results, /stop은 다음 단계에서 추가 예정입니다.`);
-            lines.push(`지금은 /plan, /live, /result <id>, /auto-safe-off를 사용하세요.`);
+            lines.push(`현재 /go, /status는 바로 사용할 수 있습니다.`);
+            lines.push(`/results, /stop은 다음 단계에서 추가 예정입니다.`);
+            lines.push(`지금은 /plan, /live, /status, /result <id>, /auto-safe-off를 사용할 수 있습니다.`);
             await sendTelegramLong(lines.join('\n'));
         } catch (e: any) {
             await sendTelegramReport(`작업 시작 중 오류가 발생했어요: ${e?.message || e}`);
