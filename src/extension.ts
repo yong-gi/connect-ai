@@ -1956,33 +1956,73 @@ function _releaseTelegramLockIfOwned(): void {
   } catch { /* ignore */ }
 }
 
-const TELEGRAM_HELP = `🤖 *Connect AI 봇* — 비서가 24시간 대기 중
+const TELEGRAM_HELP = `🤖 *Connect AI 사용법*
 
-*그냥 자연어로 말해주세요. 비서가 알아서 처리합니다.*
+평소에는 아래 4개만 쓰면 됩니다.
 
-📅 *일정*
-"오늘 일정 뭐야" / "내일 3시 광고주 미팅 잡아줘" / "내일 미팅 취소"
+1. \`/go\` 목표
+새 일을 맡깁니다.
+예: \`/go 5060 대상 AI 수익화 강의 사업을 준비해줘\`
+지금 바로 사용할 수 있습니다.
 
-📋 *할일·상태*
-"할일 뭐 있어?" / "에이전트 뭐 하고 있어?" / "어제 뭐 했어?"
+2. \`/status\`
+지금 어디까지 진행됐는지 확인합니다.
 
-💼 *작업 분배*
-"썸네일 만들어줘" / "유튜브 트렌드 분석해줘"
-→ CEO가 적합한 에이전트에게 분배 → 결과 보고
+3. \`/results\`
+완료된 결과를 확인합니다.
 
-🤖 *에이전트 직접 지시*
-"디자이너한테 로고 시안 부탁해" / "유튜브에게 컨셉 3개 뽑으라고 해"
+4. \`/stop\`
+자동 진행을 멈춥니다.
 
-🔧 *도구·승인 상태*
-"도구 자율도 어때?" / "승인 대기 뭐 있어?"
+고급 명령 보기:
+\`/help advanced\`
 
-━━━━━━━━━━━━━
-*명령어 (옵션, 없어도 됨)*
-\`/done <id>\` — 작업 완료 (id로 확실하게)
-\`/cancel <id>\` — 작업 취소
-\`/skill\` — 직전 산출물을 패턴(스킬)으로 저장 (다음 호출부터 자동 참조)
-\`/skills [에이전트id]\` — 저장된 스킬 목록 보기
-\`/help\` — 이 도움말`;
+주의:
+현재 \`/status\`, \`/results\`, \`/stop\`은 다음 단계에서 추가 예정입니다.
+지금은 \`/go\`만 바로 사용할 수 있습니다.`;
+
+function _buildTelegramAdvancedHelp(): string {
+  return [
+    '🤖 *Connect AI 고급 명령*',
+    '',
+    '*모바일 시작*',
+    '- `/go`',
+    '',
+    '*작업 생성*',
+    '- `/delegate`',
+    '- `/research`',
+    '- `/ceo`',
+    '',
+    '*흐름 보기*',
+    '- `/plan`',
+    '',
+    '*실행*',
+    '- `/run-safe`',
+    '- `/run-ready`',
+    '- `/run-plan`',
+    '',
+    '*결과 확인*',
+    '- `/result`',
+    '',
+    '*정리/복구*',
+    '- `/cancel-plan`',
+    '- `/retry`',
+    '',
+    '*안전 자동화*',
+    '- `/auto-safe-status`',
+    '- `/auto-safe-on`',
+    '- `/auto-safe-run-once`',
+    '- `/auto-safe-off`',
+    '',
+    '*상태 확인*',
+    '- `/queue`',
+    '- `/progress`',
+    '- `/live`',
+    '',
+    '일반 사용자는 `/go` 중심으로 쓰면 됩니다.',
+    '향후 모바일용 상위 명령어: `/go`, `/status`, `/results`, `/stop`',
+  ].join('\n');
+}
 
 const AUTONOMY_LABELS: Record<number, string> = {
     0: 'Off',
@@ -2052,8 +2092,13 @@ async function handleTelegramCommand(text: string): Promise<void> {
     const cmd = trimmed.split(/\s+/)[0].toLowerCase();
     const rest = trimmed.slice(cmd.length).trim();
 
-    if (cmd === '/help' || cmd === '/start') {
-        await sendTelegramReport(TELEGRAM_HELP);
+    if (cmd === '/help' || cmd === '/start' || cmd === '/commands') {
+        const helpMode = cmd === '/commands' ? 'advanced' : rest.trim().toLowerCase();
+        if ((cmd === '/help' && helpMode === 'advanced') || cmd === '/commands') {
+            await sendTelegramLong(_buildTelegramAdvancedHelp());
+        } else {
+            await sendTelegramReport(TELEGRAM_HELP);
+        }
         return;
     }
     /* Plan B (2026-05-03 단순화) — 슬래시 명령은 4개만 유지:
@@ -2754,6 +2799,71 @@ async function handleTelegramCommand(text: string): Promise<void> {
         await sendTelegramReport(`⏸ Safe Auto OFF`);
         return;
     }
+    if (cmd === '/go') {
+        const goal = rest.trim();
+        if (!goal) {
+            await sendTelegramReport('사용법: `/go 5060 대상 AI 수익화 강의 사업을 준비해줘`');
+            return;
+        }
+        if (_autoSafeState.enabled || _autoSafeState.running) {
+            await sendTelegramReport([
+                `이미 진행 중인 Safe Auto가 있어요.`,
+                `먼저 /auto-safe-status 또는 /auto-safe-off를 확인해주세요.`,
+            ].join('\n'));
+            return;
+        }
+        try {
+            const result = await _delegateCreatePlan(goal);
+            if (!result.ok) {
+                const note = result.skipped.length > 0 ? `\n\n_중복 제목으로 제외된 항목: ${result.skipped.length}개_` : '';
+                await sendTelegramLong(`❗ *작업 등록 실패 / 계획 미리보기*\n\n${result.preview}${note}\n\n_새로 등록은 하지 않았어요._`);
+                return;
+            }
+
+            _autoSafeState.enabled = true;
+            _autoSafeState.activePlanId = result.planId;
+            _autoSafeState.running = false;
+            _autoSafeState.lastRunAt = '';
+            _autoSafeState.lastTickAt = '';
+            _autoSafeState.lastError = '';
+
+            const lines: string[] = [];
+            lines.push(`작업을 시작했어요`);
+            lines.push('');
+            lines.push(`목표:`);
+            lines.push(goal.slice(0, 400));
+            lines.push('');
+            lines.push(`생성된 플랜:`);
+            lines.push(`- planId: \`${result.planId}\``);
+            lines.push('');
+            lines.push(`등록된 작업:`);
+            for (const task of result.created) {
+                const a = AGENTS[(task.agentIds && task.agentIds[0]) || 'ceo'] || AGENTS.ceo;
+                lines.push(`- ${a.emoji} ${a.name}: \`${task.id.slice(-9)}\` ${task.title}`);
+            }
+            if (result.skipped.length > 0) {
+                lines.push('');
+                lines.push(`_중복 제목으로 제외: ${result.skipped.length}개_`);
+            }
+            lines.push('');
+            lines.push(`🛡️ Safe Auto: ON`);
+            lines.push(`다음 tick부터 자동으로 진행됩니다.`);
+            lines.push('');
+            lines.push(`확인:`);
+            lines.push(`- /plan : 실행 흐름 보기`);
+            lines.push(`- /live : 현재 상태 보기`);
+            lines.push(`- /auto-safe-status : Safe Auto 상태 보기`);
+            lines.push(`- /auto-safe-off : 자동 진행 중단`);
+            lines.push('');
+            lines.push(`주의:`);
+            lines.push(`현재 /status, /results, /stop은 다음 단계에서 추가 예정입니다.`);
+            lines.push(`지금은 /plan, /live, /result <id>, /auto-safe-off를 사용하세요.`);
+            await sendTelegramLong(lines.join('\n'));
+        } catch (e: any) {
+            await sendTelegramReport(`작업 시작 중 오류가 발생했어요: ${e?.message || e}`);
+        }
+        return;
+    }
     if (cmd === '/research') {
         const researchQuery = rest.trim();
         if (!researchQuery) {
@@ -2833,60 +2943,13 @@ async function handleTelegramCommand(text: string): Promise<void> {
             return;
         }
         try {
-            const systemPrompt = buildDelegateTelegramSystemPrompt();
-            const model = getCeoPlanningModel();
-            const planId = _delegateNewPlanId();
-            const isTemplatePlan = _delegateIsCoursePilotTemplateGoal(goal);
-            const raw = await _quickLLMCall(systemPrompt, goal, 720, { model });
-            const parsed = _delegateParsePlan(raw);
-            if (!isTemplatePlan && (!parsed || !Array.isArray(parsed.tasks) || parsed.tasks.length === 0)) {
-                const preview = sanitizeCeoTelegramText(raw).trim().slice(0, 1500) || '(미리보기 없음)';
-                await sendTelegramLong(`❗ *작업 등록 실패 / 계획 미리보기*\n\n${preview}\n\n_추가로 등록은 하지 않았어요._`);
+            const result = await _delegateCreatePlan(goal);
+            if (!result.ok) {
+                const note = result.skipped.length > 0 ? `\n\n_중복 제목으로 제외된 항목: ${result.skipped.length}개_` : '';
+                await sendTelegramLong(`❗ *작업 등록 실패 / 계획 미리보기*\n\n${result.preview}${note}\n\n_추가로 등록은 하지 않았어요._`);
                 return;
             }
-
-            const planned = isTemplatePlan
-                ? { summary: parsed?.summary || goal, tasks: _delegateTemplateTasks(goal) }
-                : _delegateNormalizeTasks(goal, parsed);
-            const created: TrackerTask[] = [];
-            const skipped: string[] = [];
-            const createdByRef = new Map<string, string>();
-            for (const task of planned.tasks.slice(0, 5)) {
-                if (!isTemplatePlan && !task.required && _delegateHasDuplicateTitle(task.title)) {
-                    skipped.push(task.title);
-                    continue;
-                }
-                const resolvedDependsOn = Array.isArray(task.dependsOn) ? task.dependsOn
-                    .map(d => (typeof d === 'string' ? d.trim() : ''))
-                    .filter(Boolean)
-                    .map(ref => createdByRef.get(ref.toLowerCase()) || ref)
-                    .filter(Boolean) : undefined;
-                const createdTask = addTrackerTask({
-                    title: task.title,
-                    description: [
-                        task.description,
-                        `\n[delegate goal] ${goal.slice(0, 400)}`,
-                        planned.summary ? `[delegate summary] ${planned.summary}` : ''
-                    ].filter(Boolean).join('\n').trim().slice(0, 1000),
-                    owner: 'agent',
-                    agentIds: [task.agentId],
-                    status: 'pending',
-                    priority: task.priority,
-                    dueAt: task.dueAt || undefined,
-                    planId,
-                    stage: task.stage,
-                    dependsOn: resolvedDependsOn,
-                });
-                created.push(createdTask);
-                createdByRef.set((task.key || task.agentId || task.title).trim().toLowerCase(), createdTask.id);
-            }
-
-            if (created.length === 0) {
-                const preview = sanitizeCeoTelegramText(raw).trim().slice(0, 1500) || '(미리보기 없음)';
-                const note = skipped.length > 0 ? `\n\n_중복 제목으로 제외된 항목: ${skipped.length}개_` : '';
-                await sendTelegramLong(`❗ *작업 등록 실패 / 계획 미리보기*\n\n${preview}${note}\n\n_새로 등록된 작업은 없어요._`);
-                return;
-            }
+            const { created, skipped, planId } = result;
 
             const lines: string[] = [];
             lines.push(`✅ *작업 ${created.length}개 등록 완료*`);
@@ -5288,6 +5351,63 @@ function _delegateFindPlanIdArg(arg: string): string | null {
   if (!needle) return null;
   const plans = Array.from(new Set(readTracker().tasks.map(t => (t.planId || '').trim()).filter(Boolean)));
   return plans.find(p => p === needle) || plans.find(p => p.endsWith(needle)) || null;
+}
+
+async function _delegateCreatePlan(goal: string): Promise<{
+  ok: boolean;
+  planId: string;
+  created: TrackerTask[];
+  skipped: string[];
+  preview: string;
+}> {
+  const systemPrompt = buildDelegateTelegramSystemPrompt();
+  const model = getCeoPlanningModel();
+  const planId = _delegateNewPlanId();
+  const isTemplatePlan = _delegateIsCoursePilotTemplateGoal(goal);
+  const raw = await _quickLLMCall(systemPrompt, goal, 720, { model });
+  const parsed = _delegateParsePlan(raw);
+  const preview = sanitizeCeoTelegramText(raw).trim().slice(0, 1500) || '(미리보기 없음)';
+  if (!isTemplatePlan && (!parsed || !Array.isArray(parsed.tasks) || parsed.tasks.length === 0)) {
+    return { ok: false, planId, created: [], skipped: [], preview };
+  }
+
+  const planned = isTemplatePlan
+    ? { summary: parsed?.summary || goal, tasks: _delegateTemplateTasks(goal) }
+    : _delegateNormalizeTasks(goal, parsed);
+  const created: TrackerTask[] = [];
+  const skipped: string[] = [];
+  const createdByRef = new Map<string, string>();
+  for (const task of planned.tasks.slice(0, 5)) {
+    if (!isTemplatePlan && !task.required && _delegateHasDuplicateTitle(task.title)) {
+      skipped.push(task.title);
+      continue;
+    }
+    const resolvedDependsOn = Array.isArray(task.dependsOn) ? task.dependsOn
+      .map(d => (typeof d === 'string' ? d.trim() : ''))
+      .filter(Boolean)
+      .map(ref => createdByRef.get(ref.toLowerCase()) || ref)
+      .filter(Boolean) : undefined;
+    const createdTask = addTrackerTask({
+      title: task.title,
+      description: [
+        task.description,
+        `\n[delegate goal] ${goal.slice(0, 400)}`,
+        planned.summary ? `[delegate summary] ${planned.summary}` : ''
+      ].filter(Boolean).join('\n').trim().slice(0, 1000),
+      owner: 'agent',
+      agentIds: [task.agentId],
+      status: 'pending',
+      priority: task.priority,
+      dueAt: task.dueAt || undefined,
+      planId,
+      stage: task.stage,
+      dependsOn: resolvedDependsOn,
+    });
+    created.push(createdTask);
+    createdByRef.set((task.key || task.agentId || task.title).trim().toLowerCase(), createdTask.id);
+  }
+
+  return { ok: created.length > 0, planId, created, skipped, preview };
 }
 
 function _cancelPlanFindPlanIdArg(arg: string): string | null {
