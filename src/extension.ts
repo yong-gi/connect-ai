@@ -2411,6 +2411,11 @@ function _isOpenAICompatibleExternalProvider(provider: string): boolean {
     return p === 'openai-compatible' || p === 'openai' || p === 'openai-compatible-rest';
 }
 
+function _isGeminiNativeProvider(provider: string): boolean {
+    const p = (provider || '').trim().toLowerCase();
+    return p === 'gemini' || p === 'google-gemini' || p === 'gemini-native';
+}
+
 function _normalizeOpenAICompatibleBaseUrl(baseUrl: string): string {
     let base = (baseUrl || '').trim().replace(/\/+$/g, '');
     if (!base) return '';
@@ -2419,6 +2424,65 @@ function _normalizeOpenAICompatibleBaseUrl(baseUrl: string): string {
     }
     if (/\/v1$/i.test(base)) return base;
     return `${base}/v1`;
+}
+
+function _normalizeGeminiBaseUrl(baseUrl: string): string {
+    const defaultBase = 'https://generativelanguage.googleapis.com/v1beta';
+    let base = (baseUrl || '').trim().replace(/\/+$/g, '');
+    if (!base) return defaultBase;
+    if (/\/v1beta$/i.test(base)) return base;
+    if (/\/v1$/i.test(base)) return base.replace(/\/v1$/i, '/v1beta');
+    if (/generativelanguage\.googleapis\.com/i.test(base) && !/\/v1beta/i.test(base)) {
+        return `${base}/v1beta`;
+    }
+    return base;
+}
+
+function _hostOnlyFromBaseUrl(baseUrl: string): string {
+    try {
+        const normalized = _normalizeOpenAICompatibleBaseUrl(baseUrl);
+        if (!normalized) return '';
+        return new URL(normalized).host;
+    } catch {
+        return '';
+    }
+}
+
+function _hostOnlyFromGeminiBaseUrl(baseUrl: string): string {
+    try {
+        const normalized = _normalizeGeminiBaseUrl(baseUrl);
+        if (!normalized) return 'generativelanguage.googleapis.com';
+        return new URL(normalized).host;
+    } catch {
+        return 'generativelanguage.googleapis.com';
+    }
+}
+
+function _stringifyOpenAICompatibleContentPart(part: any): string {
+    if (part == null) return '';
+    if (typeof part === 'string') return part;
+    if (typeof part === 'number' || typeof part === 'boolean') return String(part);
+    if (Array.isArray(part)) {
+        return part.map(_stringifyOpenAICompatibleContentPart).filter(Boolean).join('');
+    }
+    if (typeof part === 'object') {
+        if (typeof part.text === 'string') return part.text;
+        if (typeof part.content === 'string') return part.content;
+        if (Array.isArray(part.parts)) return part.parts.map(_stringifyOpenAICompatibleContentPart).filter(Boolean).join('');
+        if (Array.isArray(part.items)) return part.items.map(_stringifyOpenAICompatibleContentPart).filter(Boolean).join('');
+        if (typeof part.value === 'string') return part.value;
+    }
+    return '';
+}
+
+function _extractOpenAICompatibleMessageContent(message: any): string {
+    if (!message) return '';
+    const content = message.content;
+    if (typeof content === 'string') return content;
+    if (Array.isArray(content)) return content.map(_stringifyOpenAICompatibleContentPart).filter(Boolean).join('');
+    if (content && typeof content === 'object') return _stringifyOpenAICompatibleContentPart(content);
+    if (Array.isArray(message.parts)) return message.parts.map(_stringifyOpenAICompatibleContentPart).filter(Boolean).join('');
+    return '';
 }
 
 function _roleModelOverride(roleId: string, cfg = _readModelRoutingConfig()): string {
@@ -2457,27 +2521,79 @@ function _roleModelOverride(roleId: string, cfg = _readModelRoutingConfig()): st
     }
 }
 
+function _isLocalOnlyRoleRouting(roleId: string): boolean {
+    const role = (roleId || '').trim().toLowerCase();
+    return role === 'secretary' || role === 'yeongsuk' || role === 'assistant';
+}
+
 function _resolveModelForPurpose(roleId: string, purpose: _ModelRoutingPurpose): {
   model: string;
   externalModel: string;
   localFallbackModel: string;
   useExternal: boolean;
   externalEnabled: boolean;
+  externalProvider: string;
   externalTimeout: number;
   externalBaseUrl: string;
     externalApiKey: string;
 } {
     const cfg = _readModelRoutingConfig();
-    const externalEnabled = _isOpenAICompatibleExternalProvider(cfg.externalProvider) &&
-        !!cfg.externalApiBaseUrl &&
-        !!cfg.externalApiKey;
+    const provider = (cfg.externalProvider || '').trim().toLowerCase();
     const role = (roleId || '').trim().toLowerCase();
+    const localOnlyRole = _isLocalOnlyRoleRouting(role);
+
+    const localFallbackModel = (() => {
+        return (cfg.defaultModel || '').trim();
+    })();
+
+    if (localOnlyRole) {
+        const externalBaseUrl = (() => {
+            if (_isGeminiNativeProvider(provider)) return _normalizeGeminiBaseUrl(cfg.externalApiBaseUrl);
+            if (_isOpenAICompatibleExternalProvider(provider)) return _normalizeOpenAICompatibleBaseUrl(cfg.externalApiBaseUrl);
+            return (cfg.externalApiBaseUrl || '').trim();
+        })();
+        return {
+            model: localFallbackModel,
+            externalModel: '',
+            localFallbackModel,
+            useExternal: false,
+            externalEnabled: false,
+            externalProvider: provider,
+            externalTimeout: cfg.externalTimeout || cfg.localTimeout,
+            externalBaseUrl,
+            externalApiKey: cfg.externalApiKey,
+        };
+    }
 
     const externalModel = (() => {
         if (purpose === 'planner') {
             return cfg.plannerModel || cfg.ceoModel || cfg.externalApiModel || '';
         }
         if (purpose === 'ceo') {
+            return cfg.ceoModel || cfg.plannerModel || cfg.externalApiModel || '';
+        }
+        if (role === 'business' || role === 'hyunbin') {
+            return cfg.businessModel || cfg.hyunbinModel || cfg.workerModel || cfg.externalApiModel || '';
+        }
+        if (role === 'researcher') {
+            return cfg.researcherModel || '';
+        }
+        if (role === 'writer') {
+            return cfg.writerModel || '';
+        }
+        if (role === 'youtube' || role === 'leo') {
+            return cfg.leoModel || '';
+        }
+        if (role === 'instagram' || role === 'instargram' || role === 'instagram_manager' || role === 'sns') {
+            return cfg.instagramModel || '';
+        }
+        if (role === 'designer' || role === 'design') {
+            return cfg.designerModel || '';
+        }
+        if (role === 'developer' || role === 'codari') {
+            return cfg.codariModel || '';
+        }
+        if (role === 'ceo') {
             return cfg.ceoModel || cfg.plannerModel || cfg.externalApiModel || '';
         }
         return _roleModelOverride(role, cfg) || cfg.workerModel || cfg.externalApiModel || '';
@@ -2490,13 +2606,44 @@ function _resolveModelForPurpose(roleId: string, purpose: _ModelRoutingPurpose):
         if (purpose === 'ceo') {
             return cfg.ceoModel || cfg.plannerModel || cfg.externalApiModel || cfg.defaultModel;
         }
+        if (role === 'business' || role === 'hyunbin') {
+            return cfg.businessModel || cfg.hyunbinModel || cfg.workerModel || cfg.externalApiModel || cfg.defaultModel;
+        }
+        if (role === 'researcher') {
+            return cfg.researcherModel || cfg.defaultModel;
+        }
+        if (role === 'writer') {
+            return cfg.writerModel || cfg.defaultModel;
+        }
+        if (role === 'youtube' || role === 'leo') {
+            return cfg.leoModel || cfg.defaultModel;
+        }
+        if (role === 'instagram' || role === 'instargram' || role === 'instagram_manager' || role === 'sns') {
+            return cfg.instagramModel || cfg.defaultModel;
+        }
+        if (role === 'designer' || role === 'design') {
+            return cfg.designerModel || cfg.defaultModel;
+        }
+        if (role === 'developer' || role === 'codari') {
+            return cfg.codariModel || cfg.defaultModel;
+        }
         return _roleModelOverride(role, cfg) || cfg.workerModel || cfg.externalApiModel || cfg.defaultModel;
     })().trim();
 
-    const localFallbackModel = (() => {
-        if (purpose === 'planner') return (cfg.ceoModel || cfg.defaultModel || '').trim();
-        if (purpose === 'ceo') return (cfg.ceoModel || cfg.defaultModel || '').trim();
-        return (cfg.defaultModel || cfg.ceoModel || '').trim();
+    const externalBaseUrl = (() => {
+        if (_isGeminiNativeProvider(provider)) return _normalizeGeminiBaseUrl(cfg.externalApiBaseUrl);
+        if (_isOpenAICompatibleExternalProvider(provider)) return _normalizeOpenAICompatibleBaseUrl(cfg.externalApiBaseUrl);
+        return (cfg.externalApiBaseUrl || '').trim();
+    })();
+
+    const externalEnabled = (() => {
+        if (_isGeminiNativeProvider(provider)) {
+            return !!cfg.externalApiKey && !!externalModel;
+        }
+        if (_isOpenAICompatibleExternalProvider(provider)) {
+            return !!cfg.externalApiBaseUrl && !!cfg.externalApiKey && !!externalModel;
+        }
+        return false;
     })();
 
     return {
@@ -2505,8 +2652,9 @@ function _resolveModelForPurpose(roleId: string, purpose: _ModelRoutingPurpose):
         localFallbackModel,
         useExternal: externalEnabled && !!externalModel,
         externalEnabled,
+        externalProvider: provider,
         externalTimeout: cfg.externalTimeout || cfg.localTimeout,
-        externalBaseUrl: cfg.externalApiBaseUrl,
+        externalBaseUrl,
         externalApiKey: cfg.externalApiKey,
     };
 }
@@ -2519,6 +2667,8 @@ async function _callOpenAICompatibleChatCompletion(opts: {
     userPrompt: string;
     maxTokens: number;
     timeoutMs: number;
+    roleId?: string;
+    purpose?: string;
 }): Promise<string> {
     const base = _normalizeOpenAICompatibleBaseUrl(opts.baseUrl);
     if (!base) throw new Error('external API base URL is empty');
@@ -2538,8 +2688,9 @@ async function _callOpenAICompatibleChatCompletion(opts: {
         ],
         temperature: 0.2,
         stream: false,
-        max_tokens: opts.maxTokens,
+        max_tokens: Math.max(1000, Math.min(4000, Math.floor(opts.maxTokens || 0) || 0)),
     };
+    console.log(`[llm-routing] external chat start role=${opts.roleId || '(unknown)'} purpose=${opts.purpose || '(unknown)'} model=${model} host=${_hostOnlyFromBaseUrl(base) || '(unknown)'}`);
     const r = await axios.post(`${base}/chat/completions`, payload, {
         timeout: opts.timeoutMs,
         headers,
@@ -2549,10 +2700,81 @@ async function _callOpenAICompatibleChatCompletion(opts: {
         const detail = r.data?.error?.message || r.data?.error || r.data?.message || `HTTP ${r.status}`;
         throw new Error(String(detail).slice(0, 300));
     }
-    const content = r.data?.choices?.[0]?.message?.content?.toString?.() || r.data?.choices?.[0]?.message?.content || '';
+    const content = _extractOpenAICompatibleMessageContent(r.data?.choices?.[0]?.message);
     const trimmed = String(content || '').trim();
     if (!trimmed) throw new Error('external API returned empty content');
+    console.log(`[llm-routing] external chat success role=${opts.roleId || '(unknown)'} model=${model} chars=${trimmed.length}`);
     return trimmed;
+}
+
+async function _callGeminiNativeGenerateContent(opts: {
+    baseUrl: string;
+    apiKey: string;
+    model: string;
+    systemPrompt: string;
+    userPrompt: string;
+    maxTokens: number;
+    timeoutMs: number;
+    roleId?: string;
+    purpose?: string;
+}): Promise<string> {
+    const base = _normalizeGeminiBaseUrl(opts.baseUrl);
+    const model = (opts.model || '').trim();
+    const key = (opts.apiKey || '').trim();
+    if (!key) throw new Error('Gemini API key is empty');
+    if (!model) throw new Error('external API model is empty');
+    const endpoint = `${base.replace(/\/+$/g, '')}/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(key)}`;
+    const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+    };
+    const payload: any = {
+        contents: [
+            {
+                role: 'user',
+                parts: [{ text: opts.userPrompt }],
+            },
+        ],
+        generationConfig: {
+            temperature: 0.2,
+            maxOutputTokens: Math.max(2048, Math.min(4096, Math.floor(opts.maxTokens || 0) || 0)),
+            thinkingConfig: { thinkingBudget: 0 },
+        },
+    };
+    if ((opts.systemPrompt || '').trim()) {
+        payload.systemInstruction = {
+            parts: [{ text: opts.systemPrompt }],
+        };
+    }
+    const r = await axios.post(endpoint, payload, {
+        timeout: opts.timeoutMs,
+        headers,
+        validateStatus: () => true,
+    });
+    if (r.status < 200 || r.status >= 300) {
+        const detail = r.data?.error?.message || r.data?.error || r.data?.message || `HTTP ${r.status}`;
+        throw new Error(String(detail).slice(0, 300));
+    }
+    const candidate = r.data?.candidates?.[0] || {};
+    const parts = Array.isArray(candidate?.content?.parts) ? candidate.content.parts : [];
+    const text = parts.map((part: any) => _stringifyOpenAICompatibleContentPart(part)).filter(Boolean).join('\n').trim();
+    const finish = candidate?.finishReason || r.data?.promptFeedback?.blockReason || 'unknown';
+    if (!text) throw new Error('external API returned empty content');
+    const usage = r.data?.usageMetadata || {};
+    if (usage && typeof usage === 'object') {
+        const promptTokenCount = usage.promptTokenCount ?? usage.promptTokens ?? usage.inputTokenCount;
+        const candidatesTokenCount = usage.candidatesTokenCount ?? usage.outputTokenCount ?? usage.candidatesTokens;
+        const thoughtsTokenCount = usage.thoughtsTokenCount ?? usage.thoughtTokenCount ?? usage.thoughtsTokens;
+        const totalTokenCount = usage.totalTokenCount ?? usage.totalTokens;
+        const usageBits = [
+            typeof promptTokenCount === 'number' ? `promptTokenCount=${promptTokenCount}` : '',
+            typeof candidatesTokenCount === 'number' ? `candidatesTokenCount=${candidatesTokenCount}` : '',
+            typeof thoughtsTokenCount === 'number' ? `thoughtsTokenCount=${thoughtsTokenCount}` : '',
+            typeof totalTokenCount === 'number' ? `totalTokenCount=${totalTokenCount}` : '',
+        ].filter(Boolean).join(' ');
+        if (usageBits) console.log(`[llm-routing] external chat usage role=${opts.roleId || '(unknown)'} model=${model} ${usageBits}`);
+    }
+    console.log(`[llm-routing] external chat success role=${opts.roleId || '(unknown)'} model=${model} chars=${text.length} finish=${finish}`);
+    return text;
 }
 
 async function _callRoleLLMWithFallback(opts: {
@@ -2566,21 +2788,42 @@ async function _callRoleLLMWithFallback(opts: {
     localModel?: string;
 }): Promise<{ text: string; model: string; source: 'external' | 'local' | 'external-fallback-local'; fallbackError?: string }> {
     const routing = _resolveModelForPurpose(opts.roleId, opts.purpose);
-    const localModel = (opts.localModel || routing.localFallbackModel || getConfig().defaultModel || '').trim();
+    const localModel = (getConfig().defaultModel || routing.localFallbackModel || '').trim();
+    if (_isLocalOnlyRoleRouting(opts.roleId)) {
+        console.log(`[llm-routing] local-only role route role=${opts.roleId} purpose=${opts.purpose} model=${localModel || '(default)'}`);
+    }
     if (routing.useExternal) {
+        console.log(`[llm-routing] external chat start role=${opts.roleId} purpose=${opts.purpose} provider=${routing.externalProvider || 'unknown'} model=${routing.externalModel || routing.model} host=${routing.externalProvider && _isGeminiNativeProvider(routing.externalProvider) ? _hostOnlyFromGeminiBaseUrl(routing.externalBaseUrl) : _hostOnlyFromBaseUrl(routing.externalBaseUrl)}`);
         try {
-            const text = await _callOpenAICompatibleChatCompletion({
-                baseUrl: routing.externalBaseUrl,
-                apiKey: routing.externalApiKey,
-                model: routing.externalModel || routing.model,
-                systemPrompt: opts.externalSystemPrompt,
-                userPrompt: opts.externalUserPrompt,
-                maxTokens: opts.maxTokens,
-                timeoutMs: routing.externalTimeout,
-            });
+            const text = _isGeminiNativeProvider(routing.externalProvider)
+                ? await _callGeminiNativeGenerateContent({
+                    baseUrl: routing.externalBaseUrl,
+                    apiKey: routing.externalApiKey,
+                    model: routing.externalModel || routing.model,
+                    systemPrompt: opts.externalSystemPrompt,
+                    userPrompt: opts.externalUserPrompt,
+                    maxTokens: opts.maxTokens,
+                    timeoutMs: routing.externalTimeout,
+                    roleId: opts.roleId,
+                    purpose: opts.purpose,
+                })
+                : await _callOpenAICompatibleChatCompletion({
+                    baseUrl: routing.externalBaseUrl,
+                    apiKey: routing.externalApiKey,
+                    model: routing.externalModel || routing.model,
+                    systemPrompt: opts.externalSystemPrompt,
+                    userPrompt: opts.externalUserPrompt,
+                    maxTokens: opts.maxTokens,
+                    timeoutMs: routing.externalTimeout,
+                    roleId: opts.roleId,
+                    purpose: opts.purpose,
+                });
             return { text, model: routing.externalModel || routing.model, source: 'external' };
         } catch (e: any) {
+            console.warn(`[llm-routing] external chat failed role=${opts.roleId} model=${routing.externalModel || routing.model} error=${_formatAxiosLikeError(e)}`);
+            console.log(`[llm-routing] local fallback start role=${opts.roleId} purpose=${opts.purpose} fallbackModel=${localModel || '(default)'}`);
             const fallbackText = await _quickLLMCall(opts.localSystemPrompt, opts.localUserPrompt, opts.maxTokens, { model: localModel });
+            console.log(`[llm-routing] local fallback success role=${opts.roleId} chars=${String(fallbackText || '').trim().length}`);
             return {
                 text: fallbackText,
                 model: localModel,
@@ -2589,7 +2832,9 @@ async function _callRoleLLMWithFallback(opts: {
             };
         }
     }
+    console.log(`[llm-routing] local fallback start role=${opts.roleId} purpose=${opts.purpose} fallbackModel=${localModel || '(default)'}`);
     const text = await _quickLLMCall(opts.localSystemPrompt, opts.localUserPrompt, opts.maxTokens, { model: localModel });
+    console.log(`[llm-routing] local fallback success role=${opts.roleId} chars=${String(text || '').trim().length}`);
     return { text, model: localModel, source: 'local' };
 }
 
@@ -3525,7 +3770,6 @@ async function handleTelegramCommand(text: string): Promise<void> {
         }
         try {
             const cfg = getConfig();
-            const ceoModel = (vscode.workspace.getConfiguration('connectAiLab').get<string>('ceoModel') || '').trim();
             const rawResult = await _callRoleLLMWithFallback({
                 roleId: 'ceo',
                 purpose: 'ceo',
@@ -3534,10 +3778,25 @@ async function handleTelegramCommand(text: string): Promise<void> {
                 localSystemPrompt: buildCeoTelegramSystemPrompt(),
                 localUserPrompt: question,
                 maxTokens: 720,
-                localModel: ceoModel || cfg.defaultModel || '',
+                localModel: cfg.defaultModel || '',
             });
-            const answer = sanitizeCeoTelegramText(rawResult.text).trim();
-            const finalText = answer || '브레인에 근거 없음\n\n## CEO 판단\n- 브레인 근거를 찾지 못해 판단을 만들 수 없습니다.\n\n## 확인 필요\n- 관련 회사 문서와 최근 작업 기록을 다시 확인해야 합니다.';
+            const evaluated = _evaluateCeoResponse(sanitizeCeoTelegramText(rawResult.text));
+            let finalText = evaluated.normalized;
+            if (!evaluated.ok) {
+                console.warn(`[llm-routing] external CEO response rejected reason=${evaluated.reason || 'unknown'} chars=${finalText.length} preview=${_previewText(finalText, 500)}`);
+                if (rawResult.source === 'external') {
+                    const localFallback = await _quickLLMCall(buildCeoTelegramSystemPrompt(), question, 1200, { model: cfg.defaultModel || '' });
+                    const localEvaluated = _evaluateCeoResponse(sanitizeCeoTelegramText(localFallback));
+                    if (localEvaluated.ok) {
+                        finalText = localEvaluated.normalized;
+                    } else {
+                        console.warn(`[llm-routing] local CEO fallback rejected reason=${localEvaluated.reason || 'unknown'} chars=${localEvaluated.normalized.length}`);
+                    }
+                }
+            }
+            if (!finalText || !_evaluateCeoResponse(finalText).ok) {
+                finalText = '━━ 브레인 근거 ━━\n- 브레인에 근거 없음\n\n━━ CEO 판단 ━━\n1. 현재 제공된 정보 기준으로 확정 판단을 내리기 어렵습니다.\n2. 관련 회사 문서와 최근 작업 기록을 다시 확인해야 합니다.\n3. 외부/로컬 응답 형식이 충분하지 않아 보수적으로 처리합니다.\n\n━━ 확인 필요 ━━\n- 관련 회사 문서와 최근 작업 기록을 다시 확인해 주세요.';
+            }
             await sendTelegramLong(finalText);
         } catch (e: any) {
             await sendTelegramReport(`CEO 보고서를 만들지 못했어요: ${e?.message || e}`);
@@ -9784,24 +10043,103 @@ function buildExternalPlannerTelegramSystemPrompt(goal: string): string {
 }
 
 function buildExternalCeoTelegramSystemPrompt(question: string): string {
-  const company = readCompanyName();
-  const context = _buildExternalRoutingContext({ focus: question, roleLabel: 'ceo' });
-  return [
-    `[Connect AI external CEO]`,
-    `You are the CEO. Make a short, grounded decision based on the company context below.`,
-    `Do not execute tools. Do not mention run_command, create_file, edit_file, Python, API, YouTube, Leo.`,
-    `Keep the answer concise and practical.`,
-    `If evidence is weak, say so clearly.`,
-    `Company: ${company || 'Unknown'}`,
-    '',
-    `[context]`,
-    context || '(empty)',
-    '',
-    `[output]`,
-    `- Brain evidence`,
-    `- CEO decision`,
-    `- Next verification`,
-  ].join('\n');
+    const company = readCompanyName();
+    const context = _buildExternalRoutingContext({ focus: question, roleLabel: 'ceo' });
+    return [
+        `[Connect AI external CEO]`,
+        `You are the CEO. Make a grounded but sufficiently detailed decision based on the company context below.`,
+        `Do not execute tools. Do not mention run_command, create_file, edit_file, Python, API, YouTube, Leo.`,
+        `너는 형식을 검토하거나 설명하지 않는다.`,
+        `체크리스트, 판단 과정, self-check, 메타 설명을 출력하지 않는다.`,
+        `사용자에게 보낼 최종 CEO 답변만 출력한다.`,
+        `반드시 아래 3개 섹션만 출력한다.`,
+        `섹션 이름은 한 글자도 바꾸지 않는다.`,
+        `각 섹션을 생략하지 않는다.`,
+        `CEO 판단은 반드시 1, 2, 3 세 가지로 작성한다.`,
+        `전체 답변은 최소 250자 이상 작성한다.`,
+        `사용자가 "3개만 알려줘"라고 해도 섹션 구조는 유지한다.`,
+        `Keep the answer practical, but do not be too short.`,
+        `If evidence is weak, say so clearly inside the 브레인 근거 section.`,
+        `Do not mention whether the format is correct or not.`,
+        ``,
+        `━━ 브레인 근거 ━━`,
+        `- ...`,
+        ``,
+        `━━ CEO 판단 ━━`,
+        `1. ...`,
+        `2. ...`,
+        `3. ...`,
+        ``,
+        `━━ 확인 필요 ━━`,
+        `- ...`,
+        `Company: ${company || 'Unknown'}`,
+        '',
+        `[context]`,
+        context || '(empty)',
+        '',
+        `[output rules]`,
+        `- Keep each section non-empty.`,
+        `- Do not stop mid-list.`,
+        `- If you cannot fill three CEO 판단 items, still provide three short items.`,
+        `- Do not use markdown tables.`,
+        `- Do not omit any section.`,
+    ].join('\n');
+}
+
+function _normalizeCeoSectionHeadings(text: string): string {
+    const s = String(text || '').trim();
+    if (!s) return '';
+    return s
+        .replace(/^##\s*브레인\s*근거\s*$/gmi, '━━ 브레인 근거 ━━')
+        .replace(/^##\s*CEO\s*판단\s*$/gmi, '━━ CEO 판단 ━━')
+        .replace(/^##\s*확인\s*필요\s*$/gmi, '━━ 확인 필요 ━━')
+        .replace(/^━━\s*브레인\s*근거\s*━━$/gmi, '━━ 브레인 근거 ━━')
+        .replace(/^━━\s*CEO\s*판단\s*━━$/gmi, '━━ CEO 판단 ━━')
+        .replace(/^━━\s*확인\s*필요\s*━━$/gmi, '━━ 확인 필요 ━━');
+}
+
+function _stripCeoPrefixBeforeFirstSection(text: string): string {
+    const s = String(text || '').trim();
+    if (!s) return '';
+    const markers = [
+        /(?:^|\n)\s*(?:━━\s*|##\s*)?브레인\s*근거(?:\s*━━)?\s*/i,
+        /(?:^|\n)\s*(?:━━\s*|##\s*)?CEO\s*판단(?:\s*━━)?\s*/i,
+        /(?:^|\n)\s*(?:━━\s*|##\s*)?확인\s*필요(?:\s*━━)?\s*/i,
+    ];
+    let firstIndex = -1;
+    for (const re of markers) {
+        const m = re.exec(s);
+        if (m && (firstIndex < 0 || m.index < firstIndex)) firstIndex = m.index;
+    }
+    return firstIndex >= 0 ? s.slice(firstIndex).trim() : s;
+}
+
+function _evaluateCeoResponse(text: string): { ok: boolean; reason?: string; normalized: string } {
+    const normalized = _normalizeCeoSectionHeadings(_stripCeoPrefixBeforeFirstSection(text));
+    const s = normalized.trim();
+    if (!s) return { ok: false, reason: 'empty content', normalized: '' };
+    const hasEvidence = /(?:━━\s*|##\s*)?브레인\s*근거(?:\s*━━)?/.test(s);
+    const hasDecision = /(?:━━\s*|##\s*)?CEO\s*판단(?:\s*━━)?/.test(s);
+    const hasNeed = /(?:━━\s*|##\s*)?확인\s*필요(?:\s*━━)?/.test(s);
+    if (!hasEvidence || !hasDecision || !hasNeed) {
+        return {
+            ok: false,
+            reason: 'missing sections',
+            normalized: s,
+        };
+    }
+    const decisionItems = (s.match(/^\s*\d+\.\s+/gm) || []).length;
+    const hasEvidenceBullets = (s.match(/^\s*-\s+/gm) || []).length > 0;
+    if (s.length < 100) return { ok: false, reason: 'too short', normalized: s };
+    if (decisionItems < 3) return { ok: false, reason: 'missing sections', normalized: s };
+    if (!hasEvidenceBullets) return { ok: false, reason: 'missing sections', normalized: s };
+    return { ok: true, normalized: s };
+}
+
+function _previewText(text: string, maxLen = 120): string {
+    const s = String(text || '').replace(/\s+/g, ' ').trim();
+    if (!s) return '';
+    return s.length > maxLen ? s.slice(0, maxLen) : s;
 }
 
 const DELEGATE_ALLOWED_AGENT_IDS = new Set(['researcher', 'business', 'writer', 'youtube', 'instagram', 'designer', 'developer', 'secretary', 'ceo']);
