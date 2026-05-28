@@ -6599,9 +6599,9 @@ function _formatAxiosLikeError(err: any): string {
 
 function _runSafeBuildSystemPrompt(agentId: string, task: TrackerTask): string {
   const roleRules: Record<string, string> = {
-    researcher: '핵심 가설 3개 / 타깃 니즈 3개 / 강의 주제 후보 3개 / 다음 확인 필요 2개',
+    researcher: '사용자 목표·대상·기간·제약 분해 / 조사 관점 선택 / 가설·근거·리스크·검증 질문',
     business: '상품 구조 / 가격 전략 / 운영 방식 / 리스크',
-    writer: '커리큘럼 초안 / 모집글 핵심 문구 / CTA',
+    writer: '대상 독자·채널·형식 반영 / 바로 쓸 수 있는 초안 / 제목·본문·CTA',
     youtube: '채널 방향 / 영상 주제 / 업로드 운영 / 성장 포인트',
     instagram: '콘텐츠 기획 / 반응 포인트 / 배포 흐름 / 포맷 제안',
     designer: '브랜드 톤앤매너 / 시각 자산 / 디자인 방향 / 개선 포인트',
@@ -6618,6 +6618,9 @@ function _runSafeBuildSystemPrompt(agentId: string, task: TrackerTask): string {
     `텍스트 결과만 작성하세요.`,
     `700~1200자 내 압축 보고서로 답하세요.`,
     `근거가 부족하면 "현재 제공된 정보 기준 초안"이라고 표시하세요.`,
+    `공통 원칙: 사용자가 준 목표/대상/기간/제약을 우선하고, 일반론보다 실행 가능한 결과물을 우선하세요.`,
+    `불확실한 내용은 단정하지 말고 "확인 필요"로 표시하세요.`,
+    `과제와 직접 관련 없는 일반론은 줄이고, task context에 있는 조건만 우선 반영하세요.`,
     `출력 형식: ${roleRules[agentId] || roleRules.ceo}.`,
     '',
     `taskId: ${task.id}`,
