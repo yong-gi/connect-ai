@@ -6158,7 +6158,7 @@ function _delegateNewPlanId(): string {
 
 function _delegateIsCoursePilotTemplateGoal(goal: string): boolean {
   const s = (goal || '').trim();
-  return /5060/.test(s) && /AI/i.test(s) && /(강의|수익화|파일럿|모집글)/.test(s);
+  return /5060/.test(s) && /AI/i.test(s) && /(수익화|파일럿|모집글)/.test(s);
 }
 
 function addTrackerTask(partial: Partial<TrackerTask> & { title: string; owner: TrackerTask['owner'] }): TrackerTask {
@@ -6231,31 +6231,70 @@ async function _delegateCreatePlan(goal: string): Promise<{
   skipped: string[];
   preview: string;
 }> {
-  const systemPrompt = buildDelegateTelegramSystemPrompt();
   const planId = _delegateNewPlanId();
   const isTemplatePlan = _delegateIsCoursePilotTemplateGoal(goal);
   const localModel = getCeoPlanningModel();
-  const externalPrompt = buildExternalPlannerTelegramSystemPrompt(goal);
-  const rawResult = await _callRoleLLMWithFallback({
-    roleId: 'planner',
-    purpose: 'planner',
-    externalSystemPrompt: externalPrompt,
-    externalUserPrompt: goal,
-    localSystemPrompt: systemPrompt,
-    localUserPrompt: goal,
-    maxTokens: 720,
-    localModel,
-  });
-  const raw = rawResult.text;
-  const parsed = _delegateParsePlan(raw);
-  const preview = sanitizeCeoTelegramText(raw).trim().slice(0, 1500) || '(미리보기 없음)';
-  if (!isTemplatePlan && (!parsed || !Array.isArray(parsed.tasks) || parsed.tasks.length === 0)) {
-    return { ok: false, planId, created: [], skipped: [], preview };
+  const callPlanner = async (retry: boolean): Promise<{ raw: string; parsed: { summary?: string; tasks: DelegateTaskDraft[] } | null; preview: string }> => {
+    const rawResult = await _callRoleLLMWithFallback({
+      roleId: 'planner',
+      purpose: 'planner',
+      externalSystemPrompt: buildExternalPlannerTelegramSystemPrompt(goal, retry ? { retry: true } : undefined),
+      externalUserPrompt: goal,
+      localSystemPrompt: retry
+        ? `${buildDelegateTelegramSystemPrompt()}\n\n[재시도 규칙]\n- 현재 objective만 사용하세요.\n- 과거 5060 course/pilot 패턴은 금지합니다.\n- objective의 핵심 대상/형식/목표를 그대로 반영하세요.`
+        : buildDelegateTelegramSystemPrompt(),
+      localUserPrompt: goal,
+      maxTokens: 720,
+      localModel,
+    });
+    const raw = rawResult.text;
+    return {
+      raw,
+      parsed: _delegateParsePlan(raw),
+      preview: sanitizeCeoTelegramText(raw).trim().slice(0, 1500) || '(미리보기 없음)',
+    };
+  };
+
+  const first = await callPlanner(false);
+  if (!isTemplatePlan && (!first.parsed || !Array.isArray(first.parsed.tasks) || first.parsed.tasks.length === 0)) {
+    return { ok: false, planId, created: [], skipped: [], preview: first.preview };
   }
 
-  const planned = isTemplatePlan
+  let parsed = first.parsed;
+  let preview = first.preview;
+  let planned = isTemplatePlan
     ? { summary: parsed?.summary || goal, tasks: _delegateTemplateTasks(goal) }
     : _delegateNormalizeTasks(goal, parsed);
+  preview = _delegateBuildNormalizedPlanPreview(planned);
+  let mismatchReason = _delegatePlanObjectiveMismatchReason(goal, planned);
+  if (mismatchReason && !isTemplatePlan) {
+    const retry = await callPlanner(true);
+    parsed = retry.parsed;
+    if (!parsed || !Array.isArray(parsed.tasks) || parsed.tasks.length === 0) {
+      return { ok: false, planId, created: [], skipped: [], preview: retry.preview };
+    }
+    planned = _delegateNormalizeTasks(goal, parsed);
+    preview = _delegateBuildNormalizedPlanPreview(planned);
+    mismatchReason = _delegatePlanObjectiveMismatchReason(goal, planned);
+    if (mismatchReason) {
+      return {
+        ok: false,
+        planId,
+        created: [],
+        skipped: [],
+        preview: `${preview}\n\n[objective mismatch] ${mismatchReason}`,
+      };
+    }
+  } else if (mismatchReason) {
+    return {
+      ok: false,
+      planId,
+      created: [],
+      skipped: [],
+      preview: `${preview}\n\n[objective mismatch] ${mismatchReason}`,
+    };
+  }
+
   const created: TrackerTask[] = [];
   const skipped: string[] = [];
   const createdByRef = new Map<string, string>();
@@ -10278,6 +10317,244 @@ function buildCeoTelegramSystemPrompt(): string {
   ].join('\n');
 }
 
+function _delegateBuildObjectiveLockText(goal: string): string {
+  const cleanGoal = (goal || '').trim();
+  return [
+    `현재 objective를 최우선으로 유지하세요.`,
+    `최근 세션/대화/brain context는 참고만 하고 현재 objective를 덮어쓰지 마세요.`,
+    `과거 테스트 주제를 현재 objective 대신 재사용하지 마세요.`,
+    `task title/description은 현재 objective의 핵심 대상, 형식, 목표를 직접 반영해야 합니다.`,
+    cleanGoal ? `현재 objective: ${cleanGoal}` : `현재 objective: (없음)`,
+  ].join('\n');
+}
+
+function _delegateBuildObjectiveMismatchGuard(goal: string): string {
+  const cleanGoal = (goal || '').trim();
+  const has5060 = /5060/.test(cleanGoal);
+  const hasCoursePilotMarkers = /(수익화|파일럿|모집글|모집|2주 파일럿|가격 전략)/.test(cleanGoal);
+  const shouldAllowCoursePilot = has5060 && /AI/i.test(cleanGoal) && hasCoursePilotMarkers;
+  return [
+    `objective mismatch 검증 규칙:`,
+    `- mismatch 검사는 생성된 plan 본문(summary/title/description)만 대상으로 하세요.`,
+    `- 현재 objective와 명백히 어긋나는 task title/description이 실제로 있을 때만 reject하거나 다시 생성하세요.`,
+    `- goal에 없는 과거 테스트 키워드가 plan 본문 전체를 지배하면 reject하세요.`,
+    `- 애매하면 reject하지 말고 allow 하세요.`,
+    `- 일반 "AI 교육", "강의안", "90분 실습", "초보자" 목표는 5060 course-pilot 오염 신호로 보지 마세요.`,
+    `- 5060 + AI + 수익화/파일럿/모집글 조합이 명시적일 때만 course-pilot template를 허용하세요.`,
+    `- 현재 objective가 교육 모임/실습형/결과물 중심이면 교육 모임 목적을 우선하세요.`,
+    shouldAllowCoursePilot
+      ? `- 이번 objective는 명시적 course-pilot 허용 조건에 가깝습니다.`
+      : `- 이번 objective는 일반 업무 목표로 취급하세요.`,
+  ].join('\n');
+}
+
+function _delegateCollectPlanMismatchMatches(plan: { summary?: string; tasks: DelegateTaskDraft[] }): Array<{ field: string; label: string; snippet: string }> {
+  const fields: Array<{ field: string; text: string }> = [
+    { field: 'summary', text: (plan.summary || '').trim() },
+  ];
+  plan.tasks.forEach((task, idx) => {
+    const title = (task.title || '').trim();
+    const description = (task.description || '').trim();
+    if (title) fields.push({ field: `task[${idx}].title`, text: title });
+    if (description) fields.push({ field: `task[${idx}].description`, text: description });
+  });
+
+  const patterns: Array<{ label: string; regex: RegExp; strong: boolean }> = [
+    { label: '5060', regex: /\b5060\b/, strong: true },
+    { label: '수익화', regex: /수익화/, strong: true },
+    { label: '파일럿 모집', regex: /파일럿\s*모집/, strong: true },
+    { label: '2주 파일럿', regex: /2주\s*파일럿/, strong: true },
+    { label: '가격 전략', regex: /가격\s*전략/, strong: true },
+    { label: '파일럿', regex: /파일럿/, strong: false },
+    { label: '모집글', regex: /모집글/, strong: false },
+    { label: '사업', regex: /사업/, strong: false },
+    { label: '강의 사업', regex: /강의\s*사업/, strong: false },
+  ];
+
+  const matches: Array<{ field: string; label: string; snippet: string; strong: boolean }> = [];
+  for (const field of fields) {
+    const text = field.text;
+    for (const pattern of patterns) {
+      if (!pattern.regex.test(text)) continue;
+      const hit = text.match(pattern.regex);
+      matches.push({
+        field: field.field,
+        label: pattern.label,
+        snippet: (hit && hit[0]) ? hit[0].slice(0, 80) : text.slice(0, 80),
+        strong: pattern.strong,
+      });
+    }
+  }
+  return matches
+    .sort((a, b) => (a.strong === b.strong ? a.field.localeCompare(b.field) : (a.strong ? -1 : 1)))
+    .slice(0, 12)
+    .map(({ field, label, snippet }) => ({ field, label, snippet }));
+}
+
+function _delegateBuildNormalizedPlanPreview(plan: { summary?: string; tasks: DelegateTaskDraft[] }, maxLen = 1400): string {
+  const lines: string[] = [];
+  const summary = (plan.summary || '').trim();
+  if (summary) lines.push(`[summary] ${summary.slice(0, 220)}`);
+  for (const task of plan.tasks.slice(0, 5)) {
+    const agentId = _delegateNormalizeAgentId(task.agentId);
+    const title = (task.title || '').trim().slice(0, 120) || '(제목 없음)';
+    const desc = (task.description || '').trim().slice(0, 220) || '(설명 없음)';
+    lines.push(`- ${agentId}: ${title}`);
+    lines.push(`  ${desc}`);
+  }
+  const text = lines.join('\n').trim();
+  return text.length > maxLen ? text.slice(0, maxLen) : text;
+}
+
+function _delegateCoursePilotSignalLabels(text: string): string[] {
+  const s = (text || '').toLowerCase();
+  const patterns: Array<{ label: string; regex: RegExp }> = [
+    { label: '5060', regex: /\b5060\b/ },
+    { label: '수익화', regex: /수익화/ },
+    { label: '파일럿 모집', regex: /파일럿\s*모집/ },
+    { label: '2주 파일럿', regex: /2주\s*파일럿/ },
+    { label: '가격 전략', regex: /가격\s*전략/ },
+    { label: '파일럿', regex: /파일럿/ },
+    { label: '모집글', regex: /모집글/ },
+  ];
+  return patterns.filter(p => p.regex.test(s)).map(p => p.label);
+}
+
+function _delegateTaskNeedsObjectiveRewriting(goal: string, task: DelegateTaskDraft): boolean {
+  const goalText = (goal || '').trim().toLowerCase();
+  if (/5060/.test(goalText)) return false;
+  const combined = `${task.title}\n${task.description}`;
+  const labels = _delegateCoursePilotSignalLabels(combined);
+  return labels.length >= 2 || labels.includes('5060');
+}
+
+function _delegateRewriteTaskToObjective(goal: string, task: DelegateTaskDraft): DelegateTaskDraft {
+  const cleanGoal = (goal || '').trim();
+  const goalLower = cleanGoal.toLowerCase();
+  const isMeeting = /(미팅|회의|자료|정리|브리프|회의자료)/.test(cleanGoal);
+  const isEducation = /(교육 모임|실습형|90분|초보자|결과물|강의안|강의|교육|학습)/.test(cleanGoal);
+  const isWriter = _delegateNormalizeAgentId(task.agentId) === 'writer';
+  if (!isWriter || /5060/.test(goalLower)) return task;
+
+  if (isMeeting) {
+    return {
+      ...task,
+      title: '미팅 자료 초안과 핵심 메시지 정리',
+      description: '고객사 미팅 자료 초안, 핵심 메시지, 일정과 후속 액션을 정리한다.',
+    };
+  }
+  if (isEducation) {
+    return {
+      ...task,
+      title: '실습형 강의안 초안과 자료 정리',
+      description: '90분 실습형 강의안 초안, 실습 안내, 준비 자료와 결과물 흐름을 정리한다.',
+    };
+  }
+  return {
+    ...task,
+    title: '목표에 맞는 초안 작성',
+    description: '현재 objective에 맞는 초안과 핵심 자료를 정리한다.',
+  };
+}
+
+function _delegateObjectiveFallbackTask(agentId: string, goal: string): DelegateTaskDraft {
+  const cleanGoal = (goal || '').trim();
+  if (_delegateIsCoursePilotTemplateGoal(cleanGoal)) {
+    return _delegateDefaultTaskFor(agentId);
+  }
+  const isMeeting = /(미팅|회의|자료|정리|브리프|회의자료)/.test(cleanGoal);
+  const isEducation = /(교육 모임|실습형|90분|초보자|결과물|강의안|강의|교육|학습)/.test(cleanGoal);
+  if (agentId === 'writer') {
+    if (isMeeting) {
+      return {
+        ..._delegateDefaultTaskFor('writer'),
+        title: '미팅 자료 초안과 핵심 메시지 정리',
+        description: '고객사 미팅 자료 초안, 핵심 메시지, 일정과 후속 액션을 정리한다.',
+      };
+    }
+    if (isEducation) {
+      return {
+        ..._delegateDefaultTaskFor('writer'),
+        title: '실습형 강의안 초안과 자료 정리',
+        description: '90분 실습형 강의안 초안, 실습 안내, 준비 자료와 결과물 흐름을 정리한다.',
+      };
+    }
+    return {
+      ..._delegateDefaultTaskFor('writer'),
+      title: '목표에 맞는 초안 작성',
+      description: '현재 objective에 맞는 초안과 핵심 자료를 정리한다.',
+    };
+  }
+  if (agentId === 'researcher') {
+    return {
+      ..._delegateDefaultTaskFor('researcher'),
+      title: isEducation
+        ? '실습형 강의안 참고 주제 조사'
+        : isMeeting
+          ? '미팅 자료 관련 참고 정보 조사'
+          : '목표 관련 참고 정보 조사',
+      description: isEducation
+        ? '실습형 강의안에 필요한 주제, 사례, 초보자 관점을 조사한다.'
+        : isMeeting
+          ? '고객사 미팅 자료에 필요한 배경, 요구사항, 참고 정보를 조사한다.'
+          : '현재 objective에 필요한 핵심 배경, 사례, 참고 정보를 조사한다.',
+      priority: 'high',
+    };
+  }
+  if (agentId === 'business') {
+    return {
+      ..._delegateDefaultTaskFor('business'),
+      title: isMeeting
+        ? '미팅 자료용 구조와 핵심 포인트 정리'
+        : isEducation
+          ? '실습형 강의안용 실행 구조 정리'
+          : '목표 실행 구조와 조건 정리',
+      description: isMeeting
+        ? '미팅 자료에 필요한 구조, 핵심 메시지, 후속 액션을 정리한다.'
+        : isEducation
+          ? '실습형 강의안에 필요한 흐름, 준비 조건, 실습 구조를 정리한다.'
+          : '현재 objective를 실행하는 데 필요한 구조, 조건, 제약을 정리한다.',
+      priority: 'high',
+    };
+  }
+  if (agentId === 'ceo') {
+    return {
+      ..._delegateDefaultTaskFor('ceo'),
+      title: '실행 우선순위와 다음 액션 정리',
+      description: '현재 objective를 기준으로 실행 우선순위와 다음 액션을 정리한다.',
+      priority: 'high',
+    };
+  }
+  return _delegateDefaultTaskFor(agentId);
+}
+
+function _delegatePlanObjectiveMismatchReason(goal: string, plan: { summary?: string; tasks: DelegateTaskDraft[] }): string | null {
+  const cleanGoal = (goal || '').trim();
+  const goalText = cleanGoal.toLowerCase();
+  const goalHas5060 = /5060/.test(goalText);
+  if (goalHas5060) return null;
+
+  const matches = _delegateCollectPlanMismatchMatches(plan);
+  const strongMatches = matches.filter(m => ['5060', '수익화', '파일럿 모집', '2주 파일럿', '가격 전략'].includes(m.label));
+  const strongFields = new Set(strongMatches.map(m => m.field));
+  const strongLabels = new Set(strongMatches.map(m => m.label));
+  const hasTrueCoursePilotReuse =
+    strongMatches.some(m => m.label === '5060') ||
+    strongLabels.size >= 2 ||
+    strongFields.size >= 2;
+
+  if (hasTrueCoursePilotReuse) {
+    const reasonBits = strongMatches
+      .slice(0, 4)
+      .map(m => `${m.field}: "${m.snippet}"`)
+      .join(', ');
+    return reasonBits
+      ? `과거 5060 course/pilot 강한 신호가 plan 본문에 실제로 들어왔습니다: ${reasonBits}.`
+      : '과거 5060 course/pilot 강한 신호가 plan 본문에 실제로 들어왔습니다.';
+  }
+  return null;
+}
+
 function _buildExternalRoutingContext(opts: {
   focus: string;
   roleLabel: string;
@@ -10285,28 +10562,35 @@ function _buildExternalRoutingContext(opts: {
 }): string {
   const dir = getCompanyDir();
   const parts: string[] = [];
+  const plannerMode = opts.roleLabel === 'planner';
+  const identityCap = plannerMode ? 160 : 220;
+  const goalsCap = plannerMode ? 160 : 220;
+  const decisionsCap = plannerMode ? 180 : 260;
+  const trackerCap = plannerMode ? 420 : 800;
+  const recentReportsCap = plannerMode ? 120 : 500;
+  const recentLogCap = plannerMode ? 180 : 500;
   const focus = _trimText(opts.focus, 420);
   if (focus) parts.push(`[focus]\n${focus}`);
 
   try {
     const identity = _safeReadText(path.join(dir, '_shared', 'identity.md')).trim();
-    if (identity) parts.push(`[identity]\n${identity.slice(0, 220)}`);
+    if (identity) parts.push(`[identity]\n${identity.slice(0, identityCap)}`);
   } catch { /* ignore */ }
   try {
     const goals = _safeReadText(path.join(dir, '_shared', 'goals.md')).trim();
-    if (goals) parts.push(`[goals]\n${goals.slice(0, 220)}`);
+    if (goals) parts.push(`[goals]\n${goals.slice(0, goalsCap)}`);
   } catch { /* ignore */ }
   try {
     const decisions = _safeReadText(path.join(dir, '_shared', 'decisions.md')).trim();
-    if (decisions) parts.push(`[decisions]\n${decisions.slice(0, 260)}`);
+    if (decisions) parts.push(`[decisions]\n${decisions.slice(0, decisionsCap)}`);
   } catch { /* ignore */ }
   try {
     const tracker = trackerToMarkdown({ onlyOpen: true, max: 4 }).trim();
-    if (tracker) parts.push(`[tracker open tasks]\n${tracker.slice(0, 800)}`);
+    if (tracker) parts.push(`[tracker open tasks]\n${tracker.slice(0, trackerCap)}`);
   } catch { /* ignore */ }
   try {
     const recentReports = readRecentSessionReports(1, 200).trim();
-    if (recentReports) parts.push(`[recent result summary]\n${recentReports.slice(0, 500)}`);
+    if (recentReports) parts.push(`[recent result summary]\n${recentReports.slice(0, recentReportsCap)}`);
   } catch { /* ignore */ }
 
   if (opts.task) {
@@ -10322,22 +10606,35 @@ function _buildExternalRoutingContext(opts: {
       `- dependsOn: ${Array.isArray(task.dependsOn) && task.dependsOn.length > 0 ? task.dependsOn.join(', ') : '(없음)'}`,
       `- stage: ${typeof task.stage === 'undefined' ? '(없음)' : String(task.stage)}`,
       planId ? `- same plan summary:\n${_runSafePlanSummary(task).slice(0, 700)}` : '',
-      `- completed deps:\n${_runSafeDepsSummary(task).slice(0, 520)}`,
+      `- completed deps:\n${_runSafeDepsSummary(task).slice(0, plannerMode ? 260 : 520)}`,
     ].filter(Boolean).join('\n'));
   }
 
   return parts.join('\n\n');
 }
 
-function buildExternalPlannerTelegramSystemPrompt(goal: string): string {
+function buildExternalPlannerTelegramSystemPrompt(goal: string, opts?: { retry?: boolean }): string {
   const company = readCompanyName();
   const context = _buildExternalRoutingContext({ focus: goal, roleLabel: 'planner' });
+  const objectiveLock = _delegateBuildObjectiveLockText(goal);
+  const mismatchGuard = _delegateBuildObjectiveMismatchGuard(goal);
+  const retryBlock = opts?.retry
+    ? [
+        `재시도 규칙:`,
+        `- 현재 objective만 사용하세요.`,
+        `- 과거 5060 course/pilot 패턴은 금지합니다.`,
+        `- objective의 핵심 대상/형식/목표를 다시 그대로 반영하세요.`,
+      ].join('\n')
+    : '';
   return [
     `[Connect AI external planner]`,
     `You are the CEO planner for tracker registration only.`,
     `Break one big goal into 1-5 tracker tasks.`,
     `Return JSON only. No markdown. No prose. No code fences. No commentary.`,
     `Do not execute anything. Do not call tools. Do not mention run_command, create_file, edit_file, Python, API, YouTube, Leo.`,
+    objectiveLock,
+    mismatchGuard,
+    retryBlock,
     `Allowed agentId values: researcher, business, writer, youtube, instagram, designer, developer, secretary, ceo.`,
     `If uncertain about agentId, fall back to ceo.`,
     `Required task fields: title, description, agentId, priority.`,
@@ -10549,6 +10846,9 @@ function buildDelegateTelegramSystemPrompt(): string {
     `Return JSON only. No markdown. No prose. No code fences. No commentary.`,
     `Do not execute anything. Do not call tools. Do not mention run_command, create_file, edit_file, Python, API, YouTube, Leo.`,
     `Use the brain context below. If evidence is weak, keep the task small and conservative.`,
+    `현재 objective가 최우선이며, 최근 세션/대화/brain context는 참고만 하세요.`,
+    `과거 테스트 주제를 현재 objective 대신 재사용하지 마세요.`,
+    `task title/description은 현재 objective의 핵심 대상, 형식, 목표를 직접 반영해야 합니다.`,
     `Allowed agentId values: researcher, business, writer, youtube, instagram, designer, developer, secretary, ceo.`,
     `If uncertain about agentId, fall back to ceo.`,
     `Required task fields: title, description, agentId, priority.`,
@@ -10630,7 +10930,7 @@ function _delegateGoalNeedsWriter(goal: string): boolean {
 }
 
 function _delegateGoalUsesCoursePilotTemplate(goal: string): boolean {
-  return DELEGATE_TEMPLATE_GOAL_RE.test(goal || '');
+  return _delegateIsCoursePilotTemplateGoal(goal);
 }
 
 function _delegateHasSemanticOverlap(a: string, b: string): boolean {
@@ -10815,6 +11115,11 @@ function _delegateNormalizeTasks(goal: string, parsed: { summary?: string; tasks
     for (const task of parsed.tasks.slice(0, 5)) {
       const normalized = _delegateRewriteSafeTask(task, cleanGoal, inferredDueAt);
       if (!normalized) continue;
+      if (_delegateTaskNeedsObjectiveRewriting(cleanGoal, normalized)) {
+        const rewritten = _delegateRewriteTaskToObjective(cleanGoal, normalized);
+        normalized.title = rewritten.title;
+        normalized.description = rewritten.description;
+      }
       const title = normalized.title.trim();
       const description = normalized.description.trim();
       if (!title || !description) continue;
@@ -10851,11 +11156,16 @@ function _delegateNormalizeTasks(goal: string, parsed: { summary?: string; tasks
   const seenRoles = new Set<string>();
   const seenTitles = new Set<string>();
 
-  for (const task of parsed.tasks.slice(0, 5)) {
-    const normalized = _delegateRewriteSafeTask(task, cleanGoal, inferredDueAt);
-    if (!normalized) continue;
+    for (const task of parsed.tasks.slice(0, 5)) {
+      const normalized = _delegateRewriteSafeTask(task, cleanGoal, inferredDueAt);
+      if (!normalized) continue;
+      if (_delegateTaskNeedsObjectiveRewriting(cleanGoal, normalized)) {
+        const rewritten = _delegateRewriteTaskToObjective(cleanGoal, normalized);
+        normalized.title = rewritten.title;
+        normalized.description = rewritten.description;
+      }
     if (goalHasKorean && (!DELEGATE_KOREAN_RE.test(normalized.title) || !DELEGATE_KOREAN_RE.test(normalized.description))) {
-      const fallback = _delegateDefaultTaskFor(normalized.agentId);
+      const fallback = _delegateObjectiveFallbackTask(normalized.agentId, cleanGoal);
       normalized.title = fallback.title;
       normalized.description = fallback.description;
       if (!normalized.priority) normalized.priority = fallback.priority;
@@ -10879,7 +11189,7 @@ function _delegateNormalizeTasks(goal: string, parsed: { summary?: string; tasks
   const shouldAddCeo = true;
 
   if (shouldAddResearcher && !seenRoles.has('researcher')) {
-    const fallback = _delegateDefaultTaskFor('researcher');
+    const fallback = _delegateObjectiveFallbackTask('researcher', cleanGoal);
     fallback.dueAt = inferredDueAt || undefined;
     if (!seenTitles.has(fallback.title.trim().toLowerCase())) {
       result.push({ ...fallback, required: true });
@@ -10888,7 +11198,7 @@ function _delegateNormalizeTasks(goal: string, parsed: { summary?: string; tasks
     seenRoles.add('researcher');
   }
   if (shouldAddBusiness && !seenRoles.has('business')) {
-    const fallback = _delegateDefaultTaskFor('business');
+    const fallback = _delegateObjectiveFallbackTask('business', cleanGoal);
     fallback.dueAt = inferredDueAt || undefined;
     if (!seenTitles.has(fallback.title.trim().toLowerCase())) {
       result.push({ ...fallback, required: true });
@@ -10897,7 +11207,7 @@ function _delegateNormalizeTasks(goal: string, parsed: { summary?: string; tasks
     seenRoles.add('business');
   }
   if (shouldAddWriter && !seenRoles.has('writer')) {
-    const fallback = _delegateDefaultTaskFor('writer');
+    const fallback = _delegateObjectiveFallbackTask('writer', cleanGoal);
     fallback.dueAt = inferredDueAt || undefined;
     if (!seenTitles.has(fallback.title.trim().toLowerCase())) {
       result.push({ ...fallback, required: true });
@@ -10906,7 +11216,7 @@ function _delegateNormalizeTasks(goal: string, parsed: { summary?: string; tasks
     seenRoles.add('writer');
   }
   if (shouldAddCeo && !seenRoles.has('ceo')) {
-    const fallback = _delegateDefaultTaskFor('ceo');
+    const fallback = _delegateObjectiveFallbackTask('ceo', cleanGoal);
     fallback.dueAt = inferredDueAt || undefined;
     if (!seenTitles.has(fallback.title.trim().toLowerCase())) {
       result.push({ ...fallback, required: true });
