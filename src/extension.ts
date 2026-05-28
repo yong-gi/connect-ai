@@ -5649,6 +5649,9 @@ interface TrackerTask {
   dependsOn?: string[];
   resultPath?: string;
   resultSummary?: string;
+  providedDependencies?: string[];
+  upstreamSummary?: string;
+  dependencyEvidence?: string;
   /* P1-6: recurrence — when set, the task is a template that auto-spawns
      fresh copies after each completion. cadence is a simple semantic key,
      nextRunAt is computed by the recurrence loop. */
@@ -6490,6 +6493,13 @@ function formatTrackerTaskResult(task: TrackerTask): string {
   const resultSummary = (task.resultSummary || '').trim() || '(없음)';
   const resultPath = _trackerTaskResultPathText(task);
   const evidence = (task.evidence || '').trim().replace(/\s+/g, ' ') || '(없음)';
+  const providedDependencies = Array.isArray(task.providedDependencies) ? task.providedDependencies.filter(Boolean) : [];
+  const upstreamSummary = (task.upstreamSummary || '').trim();
+  const dependencyEvidence = (task.dependencyEvidence || '').trim();
+  const formatBlock = (value: string, fallback: string = '(없음)') => {
+    const s = (value || '').trim();
+    return s ? s.split(/\r?\n/).map(line => `  ${line}`).join('\n') : fallback;
+  };
 
   return [
     `📄 *작업 결과*`,
@@ -6499,6 +6509,11 @@ function formatTrackerTaskResult(task: TrackerTask): string {
     `- agentIds: ${agentIds}`,
     `- resultSummary: ${resultSummary}`,
     `- resultPath: ${resultPath}`,
+    `- providedDependencies: ${providedDependencies.length > 0 ? providedDependencies.join(', ') : '(없음)'}`,
+    `- upstreamSummary:`,
+    formatBlock(upstreamSummary),
+    `- dependencyEvidence:`,
+    formatBlock(_truncateResultText(dependencyEvidence, 600)),
     `- evidence: ${evidence}`,
   ].join('\n');
 }
@@ -6563,15 +6578,163 @@ function _runSafePlanSummary(task: TrackerTask): string {
   }).join('\n');
 }
 
+interface _RunSafeDependencyEntry {
+  taskId: string;
+  agentId: string;
+  agentName: string;
+  title: string;
+  status: string;
+  summary: string;
+  evidence: string;
+}
+
+interface _RunSafeDependencyContext {
+  providedDependencies: string[];
+  upstreamSummary: string;
+  dependencyEvidence: string;
+  completedDepsBlock: string;
+  entries: _RunSafeDependencyEntry[];
+}
+
+function _runSafeDependencyResultPreview(task: TrackerTask, maxLen = 420): string {
+  const directSummary = (task.resultSummary || '').trim();
+  if (directSummary) return _truncateResultText(directSummary, maxLen);
+
+  const fileResult = _trackerTaskResultFileContent(task);
+  if (fileResult.ok && fileResult.text) {
+    const text = fileResult.text;
+    const lines = text.split(/\r?\n/);
+    const resultIdx = lines.findIndex(line => /^\s*##\s*Result\b/i.test(line.trim()));
+    const bodyLines = resultIdx >= 0 ? lines.slice(resultIdx + 1) : lines;
+    const collected: string[] = [];
+    for (const line of bodyLines) {
+      const trimmed = line.trim();
+      if (!trimmed) {
+        if (collected.length > 0) break;
+        continue;
+      }
+      if (/^\s*##\s+/.test(trimmed) && collected.length > 0) break;
+      if (/^[-*]\s+/.test(trimmed) || /^\d+\.\s+/.test(trimmed) || trimmed.length > 0) {
+        collected.push(trimmed);
+      }
+      if (collected.join(' ').length >= maxLen) break;
+    }
+    const preview = _truncateResultText(collected.join(' '), maxLen);
+    if (preview) return preview;
+
+    const headerLines = text
+      .split(/\r?\n/)
+      .map(line => line.trim())
+      .filter(Boolean)
+      .filter(line => /^-\s+/.test(line))
+      .slice(0, 6)
+      .join(' ');
+    if (headerLines) return _truncateResultText(headerLines, maxLen);
+  }
+
+  const evidence = (task.evidence || '').trim().replace(/\s+/g, ' ');
+  return evidence ? _truncateResultText(evidence, maxLen) : '';
+}
+
 function _runSafeDepsSummary(task: TrackerTask): string {
   const deps = Array.isArray(task.dependsOn) ? task.dependsOn.filter(Boolean) : [];
   if (deps.length === 0) return '(없음)';
   return deps.map(depId => {
     const dep = findTrackerTaskByIdArg(depId);
     if (!dep) return `- ${depId}: not found`;
-    const summary = dep.status === 'done' && dep.resultSummary ? ` / ${dep.resultSummary.slice(0, 80)}` : '';
-    return `- ${dep.id.slice(-9)} ${dep.status}${summary}`;
+    const agentId = Array.isArray(dep.agentIds) && dep.agentIds.length > 0 ? dep.agentIds[0] : 'ceo';
+    const agentName = AGENTS[agentId]?.name || agentId;
+    const title = (dep.title || '').trim().slice(0, 80) || '(제목 없음)';
+    const summary = _runSafeDependencyResultPreview(dep, 420) || '(요약 없음)';
+    const evidence = (dep.evidence || '').trim().replace(/\s+/g, ' ');
+    const lines = [
+      `- ${agentName} / ${title} [${dep.status}]`,
+      `  핵심 요약: ${summary}`,
+    ];
+    if (evidence) {
+      lines.push(`  증거: ${_truncateResultText(evidence, 220)}`);
+    }
+    return lines.join('\n');
   }).join('\n');
+}
+
+function _runSafeBuildDependencyContext(task: TrackerTask): _RunSafeDependencyContext {
+  const deps = Array.isArray(task.dependsOn) ? task.dependsOn.filter(Boolean) : [];
+  const entries: _RunSafeDependencyEntry[] = [];
+  for (const depId of deps) {
+    const dep = findTrackerTaskByIdArg(depId);
+    if (!dep) {
+      entries.push({
+        taskId: depId,
+        agentId: 'unknown',
+        agentName: 'Unknown',
+        title: '(not found)',
+        status: 'not_found',
+        summary: '선행 작업을 찾지 못함',
+        evidence: '',
+      });
+      continue;
+    }
+    const agentId = Array.isArray(dep.agentIds) && dep.agentIds.length > 0 ? dep.agentIds[0] : 'ceo';
+    const agentName = AGENTS[agentId]?.name || agentId;
+    const summary = _runSafeDependencyResultPreview(dep, 420) || '요약 없음';
+    const evidence = (dep.evidence || '').trim().replace(/\s+/g, ' ');
+    entries.push({
+      taskId: dep.id,
+      agentId,
+      agentName,
+      title: (dep.title || '').trim().slice(0, 120) || '(제목 없음)',
+      status: dep.status,
+      summary,
+      evidence,
+    });
+  }
+
+  const providedDependencies = entries
+    .filter(entry => !!entry.taskId && entry.status === 'done')
+    .map(entry => entry.taskId);
+
+  const upstreamSummary = entries.length > 0
+    ? entries.map(entry => `- ${entry.agentName}: ${entry.title} / ${entry.summary}`).join('\n')
+    : '(없음)';
+
+  const dependencyEvidence = entries.length > 0
+    ? entries.map(entry => {
+        if (!entry.taskId) return '- (없음)';
+        const evidence = entry.evidence || entry.summary || '(없음)';
+        return `- ${entry.agentName} ${entry.taskId.slice(-9)}: ${evidence}`;
+      }).join('\n')
+    : '(없음)';
+
+  const completedDepsBlock = entries.length > 0
+    ? entries.map(entry => {
+        const statusLabel = entry.status === 'done'
+          ? '완료'
+          : entry.status === 'failed'
+            ? '실패'
+            : entry.status === 'in_progress'
+              ? '진행 중'
+              : entry.status === 'cancelled'
+                ? '취소'
+                : entry.status;
+        const lines = [
+          `- ${entry.agentName} / ${entry.title} [${statusLabel}]`,
+          `  핵심 요약: ${entry.summary}`,
+        ];
+        if (entry.evidence) {
+          lines.push(`  증거: ${_truncateResultText(entry.evidence, 220)}`);
+        }
+        return lines.join('\n');
+      }).join('\n')
+    : '(없음)';
+
+  return {
+    providedDependencies,
+    upstreamSummary,
+    dependencyEvidence,
+    completedDepsBlock,
+    entries,
+  };
 }
 
 function _runSafeFailureEvidence(task: TrackerTask, errMsg: string): string {
@@ -6598,6 +6761,7 @@ function _formatAxiosLikeError(err: any): string {
 }
 
 function _runSafeBuildSystemPrompt(agentId: string, task: TrackerTask): string {
+  const depContext = _runSafeBuildDependencyContext(task);
   const roleRules: Record<string, string> = {
     researcher: '사용자 목표·대상·기간·제약 분해 / 조사 관점 선택 / 가설·근거·리스크·검증 질문',
     business: '상품 구조 / 가격 전략 / 운영 방식 / 리스크',
@@ -6621,6 +6785,10 @@ function _runSafeBuildSystemPrompt(agentId: string, task: TrackerTask): string {
     `공통 원칙: 사용자가 준 목표/대상/기간/제약을 우선하고, 일반론보다 실행 가능한 결과물을 우선하세요.`,
     `불확실한 내용은 단정하지 말고 "확인 필요"로 표시하세요.`,
     `과제와 직접 관련 없는 일반론은 줄이고, task context에 있는 조건만 우선 반영하세요.`,
+    `선행 작업 결과가 제공되면 반드시 반영하세요.`,
+    `선행 결과의 대상, 가격, 인원, 채널, 핵심 가치와 충돌하면 임의로 덮어쓰지 말고 확인 필요로 표시하세요.`,
+    `충돌이 없으면 선행 결과를 우선 반영하세요.`,
+    `결과 끝에는 반드시 "반영한 선행 결과" 섹션을 작성하세요.`,
     `출력 형식: ${roleRules[agentId] || roleRules.ceo}.`,
     '',
     `taskId: ${task.id}`,
@@ -6635,13 +6803,23 @@ function _runSafeBuildSystemPrompt(agentId: string, task: TrackerTask): string {
     _runSafePlanSummary(task),
     '',
     `[완료된 선행 작업 요약]`,
-    _runSafeDepsSummary(task),
+    depContext.completedDepsBlock,
+    '',
+    `[제공된 선행 작업 ID]`,
+    depContext.providedDependencies.length > 0 ? depContext.providedDependencies.join(', ') : '(없음)',
+    '',
+    `[상위 요약]`,
+    depContext.upstreamSummary,
+    '',
+    `[상위 증거]`,
+    depContext.dependencyEvidence,
   ].join('\n');
 }
 
 async function _runSafeExecuteTask(task: TrackerTask): Promise<{ ok: boolean; message: string }> {
   const agentId = _runSafeAllowedAgentId(task);
   const cfg = getConfig();
+  const depContext = _runSafeBuildDependencyContext(task);
   const userPrompt = [
     `작업 제목: ${task.title}`,
     `설명: ${task.description || '(없음)'}`,
@@ -6681,9 +6859,22 @@ async function _runSafeExecuteTask(task: TrackerTask): Promise<{ ok: boolean; me
     `- llmSource: ${externalResult.source}`,
     externalResult.fallbackError ? `- fallbackError: ${externalResult.fallbackError}` : '',
     `- resultSummary: ${_runSafeSummarize(resultText)}`,
+    `- providedDependencies: ${depContext.providedDependencies.length > 0 ? depContext.providedDependencies.join(', ') : '(없음)'}`,
+    `- upstreamSummary:`,
+    depContext.upstreamSummary,
+    `- dependencyEvidence:`,
+    depContext.dependencyEvidence,
     ``,
     `## Result`,
     resultText,
+    ``,
+    `## 반영한 선행 결과`,
+    depContext.entries.length > 0
+      ? depContext.entries.map(entry => {
+          const statusLabel = entry.status === 'done' ? '반영' : entry.status === 'not_found' ? '확인 필요' : entry.status;
+          return `- ${entry.agentName}: ${entry.title} (${statusLabel})`;
+        }).join('\n')
+      : '- 없음',
     ``,
   ].join('\n');
   fs.writeFileSync(resultPath, fileBody, 'utf-8');
@@ -6694,9 +6885,15 @@ async function _runSafeExecuteTask(task: TrackerTask): Promise<{ ok: boolean; me
     completedAt,
     resultPath,
     resultSummary: summary,
+    providedDependencies: depContext.providedDependencies,
+    upstreamSummary: depContext.upstreamSummary,
+    dependencyEvidence: depContext.dependencyEvidence,
     evidence: [
       `결과 파일: ${relativePath}`,
       `요약: ${summary}`,
+      `providedDependencies: ${depContext.providedDependencies.length > 0 ? depContext.providedDependencies.join(', ') : '(없음)'}`,
+      `upstreamSummary: ${_runSafeSummarize(depContext.upstreamSummary, 260)}`,
+      `dependencyEvidence: ${_runSafeSummarize(depContext.dependencyEvidence, 260)}`,
     ].join('\n'),
   });
   return { ok: true, message: `✅ run-safe 완료\n- 작업: \`${task.id.slice(-9)}\` ${task.title}\n- 결과 요약: ${summary}\n- 결과 파일: \`${relativePath}\`` };
