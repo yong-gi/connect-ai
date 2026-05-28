@@ -5651,6 +5651,7 @@ interface TrackerTask {
   resultSummary?: string;
   providedDependencies?: string[];
   upstreamSummary?: string;
+  coreConditions?: string;
   dependencyEvidence?: string;
   /* P1-6: recurrence — when set, the task is a template that auto-spawns
      fresh copies after each completion. cadence is a simple semantic key,
@@ -6495,6 +6496,7 @@ function formatTrackerTaskResult(task: TrackerTask): string {
   const evidence = (task.evidence || '').trim().replace(/\s+/g, ' ') || '(없음)';
   const providedDependencies = Array.isArray(task.providedDependencies) ? task.providedDependencies.filter(Boolean) : [];
   const upstreamSummary = (task.upstreamSummary || '').trim();
+  const coreConditions = (task.coreConditions || '').trim();
   const dependencyEvidence = (task.dependencyEvidence || '').trim();
   const formatBlock = (value: string, fallback: string = '(없음)') => {
     const s = (value || '').trim();
@@ -6512,6 +6514,8 @@ function formatTrackerTaskResult(task: TrackerTask): string {
     `- providedDependencies: ${providedDependencies.length > 0 ? providedDependencies.join(', ') : '(없음)'}`,
     `- upstreamSummary:`,
     formatBlock(upstreamSummary),
+    `- coreConditions:`,
+    formatBlock(coreConditions),
     `- dependencyEvidence:`,
     formatBlock(_truncateResultText(dependencyEvidence, 600)),
     `- evidence: ${evidence}`,
@@ -6585,55 +6589,110 @@ interface _RunSafeDependencyEntry {
   title: string;
   status: string;
   summary: string;
+  keyConditions: string[];
   evidence: string;
 }
 
 interface _RunSafeDependencyContext {
   providedDependencies: string[];
   upstreamSummary: string;
+  coreConditions: string;
   dependencyEvidence: string;
+  promptBlock: string;
   completedDepsBlock: string;
   entries: _RunSafeDependencyEntry[];
 }
 
+const _RUN_SAFE_DEPENDENCY_KEYWORD_PATTERNS: Array<{ label: string; regex: RegExp }> = [
+  { label: '대상', regex: /(대상|타깃|타겟|청중|독자|고객|수강생|참여자|학습자)/i },
+  { label: '가격', regex: /(가격|요금|비용|금액|월\s*\d|연\s*\d|원\b|만원|천원|무료|유료)/i },
+  { label: '인원', regex: /(인원|정원|모집\s*\d|n명|\d+\s*명|선착순|정원\s*\d)/i },
+  { label: '모집', regex: /(모집|모집글|모집 기간|모집인원|신청|접수|등록)/i },
+  { label: '채널', regex: /(채널|플랫폼|카카오|카톡|텔레그램|telegram|youtube|유튜브|인스타|instagram|블로그|랜딩|홈페이지|오프라인)/i },
+  { label: '핵심 가치', regex: /(핵심 가치|가치 제안|value proposition|차별화|메시지|포지셔닝|혜택|장점)/i },
+  { label: '목표', regex: /(목표|성과|성과지표|KPI|달성|전환|매출|리드|리드수)/i },
+  { label: '기간', regex: /(기간|일정|마감|마감일|주간|월간|n주|n일|이번\s*주|다음\s*주|상반기|하반기)/i },
+  { label: '제약', regex: /(제약|조건|범위|한계|주의|금지|제한|must not|해야\s*하지\s*않음)/i },
+  { label: '리스크', regex: /(리스크|위험|우려|충돌|문제|이슈|부작용|주의점)/i },
+  { label: '확인 필요', regex: /(확인 필요|추가 확인|재확인|불확실|애매|모호|unknown|미정)/i },
+];
+
+function _runSafeNormalizeDependencyText(text: string): string {
+  return String(text || '').replace(/\r\n/g, '\n').replace(/[ \t]+\n/g, '\n').trim();
+}
+
+function _runSafeExtractDependencySentences(text: string): string[] {
+  const normalized = _runSafeNormalizeDependencyText(text);
+  if (!normalized) return [];
+  const chunks = normalized
+    .split(/(?<=[.!?。！？])\s+|[\n]+/)
+    .map(s => s.trim())
+    .filter(Boolean);
+  return chunks.length > 0 ? chunks : [normalized];
+}
+
+function _runSafeExtractDependencyHighlights(text: string, maxItems = 8): string[] {
+  const sentences = _runSafeExtractDependencySentences(text);
+  if (sentences.length === 0) return [];
+  const picked: string[] = [];
+  const seen = new Set<string>();
+  for (const pattern of _RUN_SAFE_DEPENDENCY_KEYWORD_PATTERNS) {
+    for (const sentence of sentences) {
+      const raw = sentence.trim();
+      if (!raw || seen.has(raw)) continue;
+      if (pattern.regex.test(raw)) {
+        picked.push(raw);
+        seen.add(raw);
+        break;
+      }
+    }
+    if (picked.length >= maxItems) break;
+  }
+  return picked;
+}
+
+function _runSafeAgeInterpretationRules(): string {
+  return [
+    `한국어 연령대 표현은 다음처럼 해석하세요.`,
+    `- 2030 = 20~30대`,
+    `- 4050 = 40~50대`,
+    `- 5060 = 50~60대`,
+    `- 불확실하면 임의로 다른 연령대를 만들지 말고 확인 필요로 표시하세요.`,
+  ].join('\n');
+}
+
 function _runSafeDependencyResultPreview(task: TrackerTask, maxLen = 420): string {
   const directSummary = (task.resultSummary || '').trim();
-  if (directSummary) return _truncateResultText(directSummary, maxLen);
-
   const fileResult = _trackerTaskResultFileContent(task);
-  if (fileResult.ok && fileResult.text) {
-    const text = fileResult.text;
-    const lines = text.split(/\r?\n/);
-    const resultIdx = lines.findIndex(line => /^\s*##\s*Result\b/i.test(line.trim()));
-    const bodyLines = resultIdx >= 0 ? lines.slice(resultIdx + 1) : lines;
-    const collected: string[] = [];
-    for (const line of bodyLines) {
-      const trimmed = line.trim();
-      if (!trimmed) {
-        if (collected.length > 0) break;
-        continue;
-      }
-      if (/^\s*##\s+/.test(trimmed) && collected.length > 0) break;
-      if (/^[-*]\s+/.test(trimmed) || /^\d+\.\s+/.test(trimmed) || trimmed.length > 0) {
-        collected.push(trimmed);
-      }
-      if (collected.join(' ').length >= maxLen) break;
-    }
-    const preview = _truncateResultText(collected.join(' '), maxLen);
-    if (preview) return preview;
-
-    const headerLines = text
-      .split(/\r?\n/)
-      .map(line => line.trim())
-      .filter(Boolean)
-      .filter(line => /^-\s+/.test(line))
-      .slice(0, 6)
-      .join(' ');
-    if (headerLines) return _truncateResultText(headerLines, maxLen);
+  const sourceText = directSummary || (fileResult.ok && fileResult.text ? fileResult.text : '');
+  if (!sourceText) {
+    const evidence = (task.evidence || '').trim().replace(/\s+/g, ' ');
+    return evidence ? _truncateResultText(evidence, maxLen) : '';
   }
 
-  const evidence = (task.evidence || '').trim().replace(/\s+/g, ' ');
-  return evidence ? _truncateResultText(evidence, maxLen) : '';
+  const highlights = _runSafeExtractDependencyHighlights(sourceText, 8);
+  const highlightBlock = highlights.length > 0
+    ? `핵심 조건: ${highlights.join(' / ')}`
+    : '';
+  const baseSummary = directSummary
+    ? _truncateResultText(directSummary, maxLen)
+    : _truncateResultText(
+        _runSafeExtractDependencySentences(sourceText).slice(0, 3).join(' '),
+        maxLen
+      );
+  const combined = [highlightBlock, baseSummary].filter(Boolean).join('\n');
+  return _truncateResultText(combined, maxLen);
+}
+
+function _runSafeDependencyKeyConditions(task: TrackerTask, maxItems = 8): string[] {
+  const directSummary = (task.resultSummary || '').trim();
+  const fileResult = _trackerTaskResultFileContent(task);
+  const sourceText = directSummary || (fileResult.ok && fileResult.text ? fileResult.text : '');
+  if (!sourceText) {
+    const fallbackEvidence = (task.evidence || '').trim();
+    return fallbackEvidence ? _runSafeExtractDependencyHighlights(fallbackEvidence, maxItems) : [];
+  }
+  return _runSafeExtractDependencyHighlights(sourceText, maxItems);
 }
 
 function _runSafeDepsSummary(task: TrackerTask): string {
@@ -6644,18 +6703,56 @@ function _runSafeDepsSummary(task: TrackerTask): string {
     if (!dep) return `- ${depId}: not found`;
     const agentId = Array.isArray(dep.agentIds) && dep.agentIds.length > 0 ? dep.agentIds[0] : 'ceo';
     const agentName = AGENTS[agentId]?.name || agentId;
-    const title = (dep.title || '').trim().slice(0, 80) || '(제목 없음)';
-    const summary = _runSafeDependencyResultPreview(dep, 420) || '(요약 없음)';
-    const evidence = (dep.evidence || '').trim().replace(/\s+/g, ' ');
+    const title = (dep.title || '').trim().slice(0, 60) || '(제목 없음)';
+    const summary = _runSafeDependencyResultPreview(dep, 220) || '(요약 없음)';
+    const keyConditions = _runSafeDependencyKeyConditions(dep, 5);
+    const statusLabel = dep.status === 'done'
+      ? '완료'
+      : dep.status === 'failed'
+        ? '실패'
+        : dep.status === 'in_progress'
+          ? '진행 중'
+          : dep.status === 'cancelled'
+            ? '취소'
+            : dep.status;
     const lines = [
-      `- ${agentName} / ${title} [${dep.status}]`,
+      `- ${agentName} / ${title} [${statusLabel}]`,
       `  핵심 요약: ${summary}`,
     ];
-    if (evidence) {
-      lines.push(`  증거: ${_truncateResultText(evidence, 220)}`);
+    if (keyConditions.length > 0) {
+      lines.push(`  핵심 조건: ${keyConditions.join(' / ')}`);
     }
     return lines.join('\n');
   }).join('\n');
+}
+
+function _runSafeBuildDependencyPromptBlock(entries: _RunSafeDependencyEntry[], maxLen = 1200): string {
+  if (!entries || entries.length === 0) return '(없음)';
+  const lines: string[] = [];
+  for (const entry of entries) {
+    const statusLabel = entry.status === 'done'
+      ? '완료'
+      : entry.status === 'failed'
+        ? '실패'
+        : entry.status === 'in_progress'
+          ? '진행 중'
+          : entry.status === 'cancelled'
+            ? '취소'
+            : entry.status;
+    const title = (entry.title || '').trim().slice(0, 60) || '(제목 없음)';
+    const summary = _runSafeSummarize(entry.summary || '(요약 없음)', 220);
+    const keyConditions = (entry.keyConditions || []).slice(0, 5);
+    const block = [
+      `- ${entry.agentName} / ${title} [${statusLabel}]`,
+      `  핵심 요약: ${summary}`,
+      keyConditions.length > 0 ? `  핵심 조건: ${keyConditions.join(' / ')}` : '',
+    ].filter(Boolean).join('\n');
+    const candidate = lines.length > 0 ? `${lines.join('\n')}\n${block}` : block;
+    if (candidate.length > maxLen) break;
+    lines.push(block);
+  }
+  const text = lines.join('\n');
+  return text.length > maxLen ? text.slice(0, maxLen) : text;
 }
 
 function _runSafeBuildDependencyContext(task: TrackerTask): _RunSafeDependencyContext {
@@ -6671,13 +6768,15 @@ function _runSafeBuildDependencyContext(task: TrackerTask): _RunSafeDependencyCo
         title: '(not found)',
         status: 'not_found',
         summary: '선행 작업을 찾지 못함',
+        keyConditions: [],
         evidence: '',
       });
       continue;
     }
     const agentId = Array.isArray(dep.agentIds) && dep.agentIds.length > 0 ? dep.agentIds[0] : 'ceo';
     const agentName = AGENTS[agentId]?.name || agentId;
-    const summary = _runSafeDependencyResultPreview(dep, 420) || '요약 없음';
+    const summary = _runSafeDependencyResultPreview(dep, 260) || '요약 없음';
+    const keyConditions = _runSafeDependencyKeyConditions(dep, 5);
     const evidence = (dep.evidence || '').trim().replace(/\s+/g, ' ');
     entries.push({
       taskId: dep.id,
@@ -6686,6 +6785,7 @@ function _runSafeBuildDependencyContext(task: TrackerTask): _RunSafeDependencyCo
       title: (dep.title || '').trim().slice(0, 120) || '(제목 없음)',
       status: dep.status,
       summary,
+      keyConditions,
       evidence,
     });
   }
@@ -6695,7 +6795,11 @@ function _runSafeBuildDependencyContext(task: TrackerTask): _RunSafeDependencyCo
     .map(entry => entry.taskId);
 
   const upstreamSummary = entries.length > 0
-    ? entries.map(entry => `- ${entry.agentName}: ${entry.title} / ${entry.summary}`).join('\n')
+    ? entries.map(entry => {
+        const core = entry.summary.split(/\n+/).map(s => s.trim()).filter(Boolean)[0] || entry.summary;
+        const keys = entry.keyConditions.length > 0 ? ` / 핵심 조건: ${entry.keyConditions.slice(0, 5).join(' · ')}` : '';
+        return `- ${entry.agentName}: ${entry.title} / ${core}${keys}`;
+      }).join('\n')
     : '(없음)';
 
   const dependencyEvidence = entries.length > 0
@@ -6703,6 +6807,13 @@ function _runSafeBuildDependencyContext(task: TrackerTask): _RunSafeDependencyCo
         if (!entry.taskId) return '- (없음)';
         const evidence = entry.evidence || entry.summary || '(없음)';
         return `- ${entry.agentName} ${entry.taskId.slice(-9)}: ${evidence}`;
+      }).join('\n')
+    : '(없음)';
+
+  const coreConditions = entries.length > 0
+    ? entries.map(entry => {
+        const keys = entry.keyConditions.length > 0 ? entry.keyConditions.slice(0, 5).join(' / ') : '(핵심 조건 없음)';
+        return `- ${entry.agentName}: ${keys}`;
       }).join('\n')
     : '(없음)';
 
@@ -6721,6 +6832,9 @@ function _runSafeBuildDependencyContext(task: TrackerTask): _RunSafeDependencyCo
           `- ${entry.agentName} / ${entry.title} [${statusLabel}]`,
           `  핵심 요약: ${entry.summary}`,
         ];
+        if (entry.keyConditions.length > 0) {
+          lines.push(`  핵심 조건: ${entry.keyConditions.slice(0, 5).join(' / ')}`);
+        }
         if (entry.evidence) {
           lines.push(`  증거: ${_truncateResultText(entry.evidence, 220)}`);
         }
@@ -6731,7 +6845,9 @@ function _runSafeBuildDependencyContext(task: TrackerTask): _RunSafeDependencyCo
   return {
     providedDependencies,
     upstreamSummary,
+    coreConditions,
     dependencyEvidence,
+    promptBlock: _runSafeBuildDependencyPromptBlock(entries, 1200),
     completedDepsBlock,
     entries,
   };
@@ -6789,6 +6905,12 @@ function _runSafeBuildSystemPrompt(agentId: string, task: TrackerTask): string {
     `선행 결과의 대상, 가격, 인원, 채널, 핵심 가치와 충돌하면 임의로 덮어쓰지 말고 확인 필요로 표시하세요.`,
     `충돌이 없으면 선행 결과를 우선 반영하세요.`,
     `결과 끝에는 반드시 "반영한 선행 결과" 섹션을 작성하세요.`,
+    ...(agentId === 'writer' || agentId === 'researcher'
+      ? [
+          `_한국어 연령대 해석 규칙_`,
+          _runSafeAgeInterpretationRules(),
+        ]
+      : []),
     `출력 형식: ${roleRules[agentId] || roleRules.ceo}.`,
     '',
     `taskId: ${task.id}`,
@@ -6800,19 +6922,10 @@ function _runSafeBuildSystemPrompt(agentId: string, task: TrackerTask): string {
     `dependsOn: ${Array.isArray(task.dependsOn) && task.dependsOn.length > 0 ? task.dependsOn.join(', ') : '(없음)'}`,
     '',
     `[같은 plan 작업]`,
-    _runSafePlanSummary(task),
+    _runSafePlanSummary(task).slice(0, 520),
     '',
-    `[완료된 선행 작업 요약]`,
-    depContext.completedDepsBlock,
-    '',
-    `[제공된 선행 작업 ID]`,
-    depContext.providedDependencies.length > 0 ? depContext.providedDependencies.join(', ') : '(없음)',
-    '',
-    `[상위 요약]`,
-    depContext.upstreamSummary,
-    '',
-    `[상위 증거]`,
-    depContext.dependencyEvidence,
+    `[선행 작업 압축 요약]`,
+    depContext.promptBlock,
   ].join('\n');
 }
 
@@ -6862,6 +6975,12 @@ async function _runSafeExecuteTask(task: TrackerTask): Promise<{ ok: boolean; me
     `- providedDependencies: ${depContext.providedDependencies.length > 0 ? depContext.providedDependencies.join(', ') : '(없음)'}`,
     `- upstreamSummary:`,
     depContext.upstreamSummary,
+    `- coreConditions:`,
+    depContext.entries.length > 0
+      ? depContext.entries.map(entry => entry.keyConditions.length > 0
+          ? `  - ${entry.agentName}: ${entry.keyConditions.join(' / ')}`
+          : `  - ${entry.agentName}: (핵심 조건 없음)`).join('\n')
+      : '(없음)',
     `- dependencyEvidence:`,
     depContext.dependencyEvidence,
     ``,
@@ -6887,12 +7006,14 @@ async function _runSafeExecuteTask(task: TrackerTask): Promise<{ ok: boolean; me
     resultSummary: summary,
     providedDependencies: depContext.providedDependencies,
     upstreamSummary: depContext.upstreamSummary,
+    coreConditions: depContext.coreConditions,
     dependencyEvidence: depContext.dependencyEvidence,
     evidence: [
       `결과 파일: ${relativePath}`,
       `요약: ${summary}`,
       `providedDependencies: ${depContext.providedDependencies.length > 0 ? depContext.providedDependencies.join(', ') : '(없음)'}`,
       `upstreamSummary: ${_runSafeSummarize(depContext.upstreamSummary, 260)}`,
+      `coreConditions: ${_runSafeSummarize(depContext.coreConditions, 260)}`,
       `dependencyEvidence: ${_runSafeSummarize(depContext.dependencyEvidence, 260)}`,
     ].join('\n'),
   });
@@ -10201,7 +10322,7 @@ function _buildExternalRoutingContext(opts: {
       `- dependsOn: ${Array.isArray(task.dependsOn) && task.dependsOn.length > 0 ? task.dependsOn.join(', ') : '(없음)'}`,
       `- stage: ${typeof task.stage === 'undefined' ? '(없음)' : String(task.stage)}`,
       planId ? `- same plan summary:\n${_runSafePlanSummary(task).slice(0, 700)}` : '',
-      `- completed deps:\n${_runSafeDepsSummary(task).slice(0, 700)}`,
+      `- completed deps:\n${_runSafeDepsSummary(task).slice(0, 520)}`,
     ].filter(Boolean).join('\n'));
   }
 
