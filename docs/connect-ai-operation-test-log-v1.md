@@ -53,7 +53,7 @@
   - Writer
 - 완료/실패 여부: `일부 성공, Writer timeout 실패`
 - 사용된 모델 라우팅:
-  - Researcher: Gemini 우선
+  - Researcher: 기본 local Qwen
   - Business: Gemini 우선
   - Writer: local Qwen
 - 좋았던 점:
