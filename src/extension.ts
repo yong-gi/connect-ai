@@ -10656,7 +10656,7 @@ function buildExternalPlannerTelegramSystemPrompt(goal: string, opts?: { retry?:
     `Allowed agentId values: researcher, business, writer, youtube, instagram, designer, developer, secretary, ceo.`,
     `If uncertain about agentId, fall back to ceo.`,
     `Required task fields: title, description, agentId, priority.`,
-    `Optional field: dueAt (ISO 8601 or null).`,
+    `Optional fields: dueAt (ISO 8601 or null), dependsOn (array of earlier task keys such as researcher/business/writer/ceo), dependencyKey, key, stage.`,
     `Max task count: 5.`,
     `Use Korean titles and descriptions when the user input is Korean.`,
     `Role responsibilities:`,
@@ -10674,7 +10674,8 @@ function buildExternalPlannerTelegramSystemPrompt(goal: string, opts?: { retry?:
     `[context]`,
     context || '(empty)',
     '',
-    `Output schema: {"summary":"...", "tasks":[{"title":"...","description":"...","agentId":"researcher","priority":"normal","dueAt":null}]}`,
+    `If a task depends on earlier work, set dependsOn explicitly instead of leaving it implicit.`,
+    `Output schema: {"summary":"...", "tasks":[{"title":"...","description":"...","agentId":"researcher","priority":"normal","dueAt":null,"dependsOn":["researcher"]}]}`,
   ].join('\n');
 }
 
@@ -10870,9 +10871,10 @@ function buildDelegateTelegramSystemPrompt(): string {
     `Allowed agentId values: researcher, business, writer, youtube, instagram, designer, developer, secretary, ceo.`,
     `If uncertain about agentId, fall back to ceo.`,
     `Required task fields: title, description, agentId, priority.`,
-    `Optional field: dueAt (ISO 8601 or null).`,
+    `Optional fields: dueAt (ISO 8601 or null), dependsOn (array of earlier task keys such as researcher/business/writer/ceo), dependencyKey, key, stage.`,
     `Max task count: 5.`,
-    `Output schema: {"summary":"...", "tasks":[{"title":"...","description":"...","agentId":"researcher","priority":"normal","dueAt":null}]}`,
+    `If a task depends on earlier work, set dependsOn explicitly instead of leaving it implicit.`,
+    `Output schema: {"summary":"...", "tasks":[{"title":"...","description":"...","agentId":"researcher","priority":"normal","dueAt":null,"dependsOn":["researcher"]}]}`,
     `Role responsibilities:`,
     `- Researcher: 시장, 고객, 주제, 경쟁/사례 조사`,
     `- Business: 상품 구조, 가격 전략, 수익 모델, 운영 방식`,
@@ -11034,6 +11036,34 @@ function _delegateTemplateTasks(goal: string, dueAt?: string): DelegateTaskDraft
   ];
 }
 
+function _delegateEnsureDependsOn(tasks: DelegateTaskDraft[]): DelegateTaskDraft[] {
+  const normalized = tasks.map(task => ({
+    ...task,
+    agentId: _delegateNormalizeAgentId(task.agentId),
+    dependsOn: Array.isArray(task.dependsOn)
+      ? task.dependsOn.map(dep => (typeof dep === 'string' ? dep.trim() : '')).filter(Boolean)
+      : undefined,
+  }));
+  const availableRoles = new Set(normalized.map(task => _delegateNormalizeAgentId(task.agentId)));
+  return normalized.map(task => {
+    const existing = Array.isArray(task.dependsOn) ? task.dependsOn.filter(Boolean) : [];
+    if (existing.length > 0) return task;
+    const role = _delegateNormalizeAgentId(task.agentId);
+    const inferred: string[] = [];
+    if (role === 'business' && availableRoles.has('researcher')) {
+      inferred.push('researcher');
+    } else if (role === 'writer') {
+      if (availableRoles.has('researcher')) inferred.push('researcher');
+      if (availableRoles.has('business')) inferred.push('business');
+    } else if (role === 'ceo') {
+      if (availableRoles.has('writer')) inferred.push('writer');
+      else if (availableRoles.has('business')) inferred.push('business');
+      else if (availableRoles.has('researcher')) inferred.push('researcher');
+    }
+    return inferred.length > 0 ? { ...task, dependsOn: inferred } : task;
+  });
+}
+
 function _delegateOpenTaskTitles(): Set<string> {
   const titles = new Set<string>();
   for (const task of listOpenTrackerTasks()) {
@@ -11166,7 +11196,7 @@ function _delegateNormalizeTasks(goal: string, parsed: { summary?: string; tasks
 
     return {
       summary: parsed.summary,
-      tasks: result.slice(0, 5),
+      tasks: _delegateEnsureDependsOn(result.slice(0, 5)),
     };
   }
 
@@ -11267,7 +11297,7 @@ function _delegateNormalizeTasks(goal: string, parsed: { summary?: string; tasks
 
   return {
     summary: parsed.summary,
-    tasks: unique,
+    tasks: _delegateEnsureDependsOn(unique),
   };
 }
 
