@@ -2081,6 +2081,23 @@ function _statusCollectPlanTasks(planId: string): TrackerTask[] {
     });
 }
 
+function _statusBuildTaskTotals(tasks: TrackerTask[]): { done: number; inProgress: number; pending: number; failed: number; cancelled: number } {
+  return {
+    done: tasks.filter(t => t.status === 'done').length,
+    inProgress: tasks.filter(t => t.status === 'in_progress').length,
+    pending: tasks.filter(t => t.status === 'pending').length,
+    failed: tasks.filter(t => t.status === 'failed').length,
+    cancelled: tasks.filter(t => t.status === 'cancelled').length,
+  };
+}
+
+function _statusFormatStageValue(stageValue: number): string {
+  if (!isFinite(stageValue) || stageValue === Number.MAX_SAFE_INTEGER || stageValue < 0) {
+    return '단계 정보 없음';
+  }
+  return `${stageValue}단계`;
+}
+
 function _statusTaskIsReady(task: TrackerTask, byId: Map<string, TrackerTask>): boolean {
   const deps = Array.isArray(task.dependsOn) ? task.dependsOn.filter(Boolean) : [];
   for (const depId of deps) {
@@ -2133,16 +2150,10 @@ function _statusBuildReport(): string {
   const stageLines = stages.map(stageNo => {
     const stageTasks = tasks.filter(t => _delegatePlanStageSortValue(t.stage) === stageNo);
     const label = _statusStageLabel(stageTasks, byId);
-    return `- ${stageNo}단계 ${label}`;
+    return `- ${_statusFormatStageValue(stageNo)} ${label}`;
   });
 
-  const totals = {
-    done: tasks.filter(t => t.status === 'done').length,
-    inProgress: tasks.filter(t => t.status === 'in_progress').length,
-    pending: tasks.filter(t => t.status === 'pending').length,
-    failed: tasks.filter(t => t.status === 'failed').length,
-    cancelled: tasks.filter(t => t.status === 'cancelled').length,
-  };
+  const totals = _statusBuildTaskTotals(tasks);
   const readyTasks = tasks.filter(t => t.status === 'pending' && _statusTaskIsReady(t, byId)).slice(0, 3);
   const nextTasks = readyTasks.length > 0
     ? readyTasks.map(t => {
@@ -2175,7 +2186,7 @@ function _statusBuildReport(): string {
     `- 취소: ${totals.cancelled}개`,
     '',
     '현재 단계:',
-    ...stageLines,
+    ...(stageLines.length > 0 ? stageLines : ['- 단계 정보 없음 (상태 기준)']),
     '',
     '다음 작업:',
     nextTasks,
@@ -2266,13 +2277,7 @@ function _resultsBuildReport(argPlan: string): string {
 
   const goalText = _statusPlanGoalText(tasks);
   const byId = new Map(tasks.map(t => [t.id, t]));
-  const totals = {
-    done: tasks.filter(t => t.status === 'done').length,
-    failed: tasks.filter(t => t.status === 'failed').length,
-    pending: tasks.filter(t => t.status === 'pending').length,
-    inProgress: tasks.filter(t => t.status === 'in_progress').length,
-    cancelled: tasks.filter(t => t.status === 'cancelled').length,
-  };
+  const totals = _statusBuildTaskTotals(tasks);
   const taskLines: string[] = [];
   const detailIds: string[] = [];
 
@@ -3584,10 +3589,14 @@ async function handleTelegramCommand(text: string): Promise<void> {
             if (!managed.result) return;
 
             const result = managed.result;
+            const totals = _autoSafeBuildPlanTotals(planId);
             const summaryLines = [
                 `✅ auto-safe run-once 완료`,
-                `- 완료: ${result.completed}개`,
-                `- 실패: ${result.failed}개`,
+                `- 완료: ${totals.done}개`,
+                `- 실패: ${totals.failed}개`,
+                `- 대기: ${totals.pending}개`,
+                `- 진행 중: ${totals.inProgress}개`,
+                `- 취소: ${totals.cancelled}개`,
                 `- 다음 실행 가능: ${result.nextReadyText}`,
                 `다음 확인: /plan, /queue, /result <id>`,
             ];
@@ -7165,6 +7174,11 @@ function _autoSafeFormatActivePlanId(): string {
   return _autoSafeState.activePlanId ? `\`${_autoSafeState.activePlanId}\`` : '없음';
 }
 
+function _autoSafeBuildPlanTotals(planId: string): { done: number; failed: number; pending: number; inProgress: number; cancelled: number } {
+  const tasks = readTracker().tasks.filter(t => (t.planId || '').trim() === planId);
+  return _statusBuildTaskTotals(tasks);
+}
+
 async function _autoSafeRunOnceTick(planId: string, maxTasks = 2, reportLabel = 'auto-safe run-once'): Promise<{ completed: number; failed: number; blocked: boolean; remainingPending: number; nextReadyText: string; maxTasksHit: boolean } | null> {
   const initialTasks = readTracker().tasks.filter(t => (t.planId || '').trim() === planId);
   if (initialTasks.length === 0) return { completed: 0, failed: 0, blocked: false, remainingPending: 0, nextReadyText: '없음', maxTasksHit: false };
@@ -7296,11 +7310,15 @@ async function _autoSafeTimerTick(): Promise<void> {
     }
 
     if (managed.autoOffReason === 'done') {
+      const totals = _autoSafeBuildPlanTotals(planId);
       await sendTelegramLong([
         `✅ Safe Auto plan 완료, 자동 OFF`,
         `- planId: \`${planId}\``,
-        `- 완료: ${managed.result.completed}개`,
-        `- 실패: ${managed.result.failed}개`,
+        `- 완료: ${totals.done}개`,
+        `- 실패: ${totals.failed}개`,
+        `- 대기: ${totals.pending}개`,
+        `- 진행 중: ${totals.inProgress}개`,
+        `- 취소: ${totals.cancelled}개`,
       ].join('\n'));
       return;
     }
